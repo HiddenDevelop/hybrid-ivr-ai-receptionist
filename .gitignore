@@ -1,0 +1,10 @@
+node_modules/
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+*.db
+*.db-journal
+speech/voices/
+speech/samples/
+var/
