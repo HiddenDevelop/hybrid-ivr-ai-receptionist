@@ -1,21 +1,22 @@
 // Shared scheduling step: all four patient paths converge here.
 // Broad-to-narrow: first ask WHEN roughly (hoy / esta semana / la próxima
-// semana / una fecha que el paciente sugiera), then offer up to two
-// concrete slots inside that window, then yes/no confirm -> book + SMS.
-// Pure state handlers; the session engine owns strike counting, but every
-// handler resets the counter when it accepts an answer — a strike means
-// "this question failed", so a fumble at the window question must not
-// count against the slot offer or the confirmation later.
+// semana / una fecha que el paciente sugiera; keypad 1-4), then offer up
+// to two concrete slots inside that window (keypad again), then a 1/2
+// confirmation -> book + SMS. Only the suggested specific date is spoken.
+// Pure state handlers; declines and empty windows loop back to the broad
+// question indefinitely — the only ways out of scheduling are booking a
+// slot, pressing 0 for a person, * for the menu, or hanging up.
 
 const { findOpenSlotsBetween, bookAppointment } = require('../db/appointments');
 const {
-  slotOfferText, confirmSlotText, smsConfirmationText,
-  bookingConfirmedNoSmsText, PROMPTS,
+  slotOfferText, nearestSlotOfferText, confirmSlotText, smsConfirmationText,
+  bookingConfirmedNoSmsText,
 } = require('../prompts');
 
-// Total rounds of window-picking a caller gets (empty windows, past dates,
-// and declined offers all consume a round) before we hand them to a human.
-const MAX_OFFER_ROUNDS = 3;
+// When the caller's window is full, search this far past it for the nearest
+// bookable slot to propose, rather than bouncing them straight back to the
+// window menu with nothing.
+const NEAREST_SEARCH_DAYS = 60;
 
 const WINDOW_DTMF = { 1: 'today', 2: 'this_week', 3: 'next_week', 4: 'specific' };
 
@@ -64,39 +65,28 @@ function windowRange(window, now, specificDate = null) {
 // Entry point from the flows: ask the broad "when?" question.
 function startScheduling(session) {
   session.state = 'sched_window';
-  session.attempts = 0;
-  session.offerRounds = (session.offerRounds || 0) + 1;
   return [
     { type: 'play', promptId: 'ask_sched_window' },
     { type: 'listen' },
   ];
 }
 
-// Out of rounds without a slot the caller could take. NOT the "couldn't
-// understand you" handoff — this caller answered fine every time, so the
-// goodbye must not sound like it was their fault.
-function noSlotHandoff(session) {
-  session.end();
+// The caller understood an offer and turned it down — an answer, not a
+// misfire. Back to the broad question, prefixed with a reminder that 0
+// reaches a person: a caller declining round after round is looping by
+// choice, but must never be trapped without hearing the way out.
+function declineSlots(session) {
   return [
-    { type: 'play', promptId: 'slots_none' },
-    { type: 'escalate', reason: 'no_acceptable_slot' },
+    { type: 'play', promptId: 'sched_retry_hint' },
+    ...startScheduling(session),
   ];
 }
 
-// The caller understood an offer and turned it down — an answer, not a
-// misfire. Back to the broad question, or a warm handoff once the rounds
-// run out.
-function declineSlots(session) {
-  if (session.offerRounds >= MAX_OFFER_ROUNDS) return noSlotHandoff(session);
-  return startScheduling(session);
-}
-
 // A window (or a specific date) was chosen. Returns null when the choice
-// is unusable — the engine treats that as a strike on the current question.
+// is unusable — the engine replays the current question.
 function handleWindowSelection(session, window, specificDate = null) {
   if (window === 'specific' && !specificDate) {
     session.state = 'sched_date';
-    session.attempts = 0;
     return [
       { type: 'play', promptId: 'ask_preferred_date' },
       { type: 'listen' },
@@ -105,9 +95,6 @@ function handleWindowSelection(session, window, specificDate = null) {
 
   const range = windowRange(window, session.now(), specificDate);
   if (range === 'past') {
-    if (session.offerRounds >= MAX_OFFER_ROUNDS) return noSlotHandoff(session);
-    session.attempts = 0;
-    session.offerRounds += 1;
     session.state = 'sched_date';
     return [
       { type: 'play', promptId: 'date_in_past' },
@@ -119,18 +106,39 @@ function handleWindowSelection(session, window, specificDate = null) {
 
   const slots = findOpenSlotsBetween(session.db, { ...range, now: session.now(), count: 2 });
   if (slots.length === 0) {
-    if (session.offerRounds >= MAX_OFFER_ROUNDS) return noSlotHandoff(session);
-    session.attempts = 0;
-    session.offerRounds += 1;
+    // Grammar tracks what the caller asked for: one day (hoy, or a specific
+    // date) gets "ese día", a week-wide window gets "esas fechas".
+    const nonePromptId = (window === 'today' || window === 'specific')
+      ? 'slots_none_day' : 'slots_none_window';
+
+    // Don't leave the caller empty-handed: propose the nearest slot after
+    // the window they asked for, as a normal one-slot offer.
+    const nearest = findOpenSlotsBetween(session.db, {
+      from: plusDays(range.to, 1),
+      to: plusDays(range.to, NEAREST_SEARCH_DAYS),
+      now: session.now(),
+      count: 1,
+    });
+    if (nearest.length > 0) {
+      session.slots = nearest;
+      session.state = 'offer';
+      return [
+        { type: 'play', promptId: nonePromptId },
+        { type: 'playText', text: nearestSlotOfferText(nearest[0]) },
+        { type: 'listen' },
+      ];
+    }
+
+    // Nothing bookable for weeks out either — say so (with the 0 reminder)
+    // and go back to the window question.
     session.state = 'sched_window';
     return [
-      { type: 'play', promptId: 'slots_none_window' },
+      { type: 'play', promptId: 'slots_none' },
       { type: 'play', promptId: 'ask_sched_window' },
       { type: 'listen' },
     ];
   }
 
-  session.attempts = 0;
   session.slots = slots;
   session.state = 'offer';
   return [
@@ -139,17 +147,14 @@ function handleWindowSelection(session, window, specificDate = null) {
   ];
 }
 
-// 1 or 2 picks a slot; 0 declines the offer outright (spoken "ninguna" /
-// "no"). The decline KEY matches what the offer copy announces: 2 on a
-// single-slot offer ("oprima dos o diga no"), 3 on a two-slot offer
-// ("oprima tres").
+// 1 or 2 picks a slot; the decline KEY matches what the offer copy
+// announces: 2 on a single-slot offer, 3 on a two-slot offer.
 function handleSlotChoice(session, choice) {
   const declineKey = session.slots.length === 1 ? 2 : 3;
-  if (choice === 0 || choice === declineKey) return declineSlots(session);
-  if (choice !== 1 && choice !== 2) return null; // engine treats as a strike
+  if (choice === declineKey) return declineSlots(session);
+  if (choice !== 1 && choice !== 2) return null; // engine replays the offer
   const slot = session.slots[choice - 1];
   if (!slot) return null;
-  session.attempts = 0;
   session.chosenSlot = slot;
   session.state = 'confirm';
   return [
@@ -168,7 +173,6 @@ function handleConfirmation(session, yes) {
     date: slot.date,
     time: slot.time,
     reason: session.booking.reason,
-    reasonTranscript: session.booking.reasonTranscript,
     extractionConfidence: session.minConfidence,
   });
   session.end();
@@ -181,6 +185,10 @@ function handleConfirmation(session, yes) {
   } else {
     actions.push({ type: 'playText', text: bookingConfirmedNoSmsText(slot) });
   }
+  // Nudge the Google Calendar mirror so the booking lands within seconds
+  // instead of waiting for the background interval. Fire-and-forget at the
+  // dispatch layer — never blocks or fails the call.
+  actions.push({ type: 'calendarSync' });
   actions.push({ type: 'hangup' });
   return actions;
 }
@@ -190,8 +198,5 @@ module.exports = {
   handleWindowSelection,
   handleSlotChoice,
   handleConfirmation,
-  windowRange,
   WINDOW_DTMF,
-  MAX_OFFER_ROUNDS,
-  PROMPTS,
 };

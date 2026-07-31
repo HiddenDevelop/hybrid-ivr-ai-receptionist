@@ -1,7 +1,7 @@
 // Thin wrapper around local Ollama for single-shot, JSON-only field
 // extraction. Never conversational: one small prompt in, one small JSON
-// object out. If a field seems to need back-and-forth, that's a
-// human-escalation signal, not a reason to grow this prompt.
+// object out. If a field seems to need back-and-forth, that's a sign the
+// question needs redesigning, not a reason to grow this prompt.
 
 const { specs } = require('./schemas');
 
@@ -10,7 +10,17 @@ const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:14b';
 
 const CONFIDENCE_THRESHOLD = 0.7;
 
-function buildPrompt(spec, transcript, today = new Date().toISOString().slice(0, 10)) {
+// Local (clinic wall-clock) date, never UTC: with toISOString() a Puerto
+// Rico caller between 8pm and midnight gets "today" anchored to tomorrow,
+// shifting every relative date ("mañana", "este viernes") by a day.
+function localToday(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function buildPrompt(spec, transcript, today = localToday()) {
   const dateLine = spec.needsToday ? `Today is ${today}.\n` : '';
   return `${spec.instruction} The caller spoke Spanish. Respond with JSON only, no prose.\n`
     + dateLine
@@ -22,8 +32,8 @@ function buildPrompt(spec, transcript, today = new Date().toISOString().slice(0,
 // Extracts one field from a Spanish transcript. Always resolves to
 //   { ok, value, confidence, latencyMs }
 // ok=false covers model errors, unparseable JSON, and shape-validation
-// failures — all treated by callers exactly like low confidence (re-prompt,
-// then 3-strike bailout to a human).
+// failures — all treated by callers exactly like low confidence (re-prompt
+// and re-ask).
 async function extractField(fieldName, transcript, { fetchImpl = fetch } = {}) {
   const spec = specs[fieldName];
   if (!spec) throw new Error(`unknown extraction field: ${fieldName}`);
@@ -63,10 +73,6 @@ async function extractField(fieldName, transcript, { fetchImpl = fetch } = {}) {
       value: shapeOk ? value : null,
       confidence: shapeOk ? confidence : 0,
       latencyMs: Date.now() - started,
-      // Fields may lower the global bar (spec.minConfidence) — e.g. the
-      // visit reason, where nearly any answer is acceptable and the
-      // read-back confirmation catches mistakes anyway.
-      threshold: spec.minConfidence ?? CONFIDENCE_THRESHOLD,
     };
   } catch (err) {
     console.log(`[extract] ${fieldName} FAILED after ${Date.now() - started}ms: ${err}`);
@@ -104,7 +110,7 @@ async function warmUp({ fetchImpl = fetch } = {}) {
 }
 
 function isConfident(result) {
-  return result.ok && result.confidence >= (result.threshold ?? CONFIDENCE_THRESHOLD);
+  return result.ok && result.confidence >= CONFIDENCE_THRESHOLD;
 }
 
-module.exports = { extractField, isConfident, buildPrompt, warmUp, CONFIDENCE_THRESHOLD };
+module.exports = { extractField, isConfident, warmUp };

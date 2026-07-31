@@ -40,30 +40,46 @@ function readbackText(actions) {
   return actions.find((a) => a.type === 'playText')?.text;
 }
 
-// Every collected field is now read back to the caller and kept only once
-// they confirm it. Tests that aren't about the read-back itself answer the
-// question and then confirm with the keypad (1 = sí), which — unlike a
-// spoken "sí" — costs no extraction call and so leaves the scripted
-// fakeExtract sequence untouched.
+// Every collected field is read back to the caller and kept only once they
+// confirm it with the keypad (1 = sí, the only way to confirm). Tests that
+// aren't about the read-back itself answer the question and then press 1.
 async function say(session, transcript) {
   const actions = await session.onTranscript(transcript);
   if (session.state !== 'verify') return actions;
   return session.onDtmf(1);
 }
 
+// The post-op intake (surgery date -> hospital -> name -> phone) in
+// scripted-extraction and spoken form. Post-op is the path many scheduling
+// tests ride to reach sched_window, so both halves live here.
+function postOpFields() {
+  return [
+    { field: 'surgeryDate', value: { date: '2026-07-20' } },
+    { field: 'hospital', value: { hospital: 'el Hospital Auxilio Mutuo' } },
+    { field: 'fullName', value: { first_name: 'Juan', last_name: 'Rivera' } },
+    { field: 'phone', value: { phone: '7875559999' } },
+  ];
+}
+
+async function sayPostOpIntake(session) {
+  await say(session, 'me operaron el veinte de julio');
+  await say(session, 'en el Auxilio Mutuo');
+  await say(session, 'Juan Rivera');
+  await say(session, 'siete ocho siete, cinco cinco cinco, nueve nueve nueve nueve');
+}
+
 test('every promptId referenced by flows and engine exists in PROMPTS (cache coverage)', () => {
   const referenced = new Set([
-    'greeting_menu', 'menu_retry', 'reprompt_generic', 'handoff_human',
+    'greeting_menu', 'menu_retry', 'reprompt_generic',
     'handoff_operator', 'confirm_field', 'retry_field',
-    'escalate_red_flag', 'slots_none', 'booking_confirmed_sms', 'goodbye',
-    'ask_sched_window', 'ask_preferred_date', 'slots_none_window', 'date_in_past',
+    'slots_none', 'sched_retry_hint', 'booking_confirmed_sms',
+    'ask_sched_window', 'ask_preferred_date', 'slots_none_day', 'slots_none_window', 'date_in_past',
     // referenced from step hooks (accept()/after()), not step.promptId
     'clarify_insurance_type', 'vital_referral_reminder',
   ]);
   for (const flow of Object.values(FLOWS)) {
     for (const step of flow.steps) {
       referenced.add(step.promptId);
-      if (step.field === 'mrnOrPhone' && flow.patientType === 'follow_up') referenced.add('record_not_found');
     }
   }
   for (const id of referenced) {
@@ -71,60 +87,61 @@ test('every promptId referenced by flows and engine exists in PROMPTS (cache cov
   }
 });
 
-// index.js sizes each turn's TurnDetector from this: "open" tolerates a 1.8s
-// pause mid-answer (elderly callers pause while recalling names and digits),
-// "short" keeps the original 800ms where the answer is one word. Getting a
-// collection step marked "short" silently reintroduces the clipping bug.
-test('turnProfile: open while collecting or composing a date, short elsewhere', async () => {
+// index.js gates the /stt call on this AND sizes each turn's TurnDetector
+// from it: "open" tolerates a 1.8s pause mid-answer (elderly callers pause
+// while recalling names and digits). A collection step coming back false
+// silently drops the caller's answer on the floor; a keypad state coming
+// back true silently reintroduces STT where the design says it never runs.
+test('expectsSpeech: true only while collecting or composing a date', async () => {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
     { field: 'dob', value: { dob: '1985-03-12' } },
     { field: 'phone', value: { phone: '5551234567' } },
     { field: 'insuranceType', value: { insurance_type: 'commercial', provider: null } },
     { field: 'insurance', value: { provider: 'Aetna' } },
-    { field: 'allergies', value: { allergies: 'ninguna' } },
-    { field: 'reason', value: { reason: 'dolor abdominal' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
 
   session.start();
-  assert.strictEqual(session.turnProfile, 'short', 'menu: one keypress or one word');
+  assert.strictEqual(session.expectsSpeech, false, 'menu: keypad only, no STT');
 
   session.onDtmf(1); // new patient -> collect
-  assert.strictEqual(session.turnProfile, 'open', 'collect: caller composes the answer aloud');
+  assert.strictEqual(session.expectsSpeech, true, 'collect: caller composes the answer aloud');
   await session.onTranscript('me llamo María García'); // -> verify (read-back)
-  assert.strictEqual(session.turnProfile, 'short', 'verify: sí/no answer to the read-back');
+  assert.strictEqual(session.expectsSpeech, false, 'verify: keys 1/2 only, no STT');
   session.onDtmf(1); // confirmed -> next field
-  assert.strictEqual(session.turnProfile, 'open', 'still collecting after a field lands');
+  assert.strictEqual(session.expectsSpeech, true, 'still collecting after a field lands');
 
-  for (const t of ['doce de marzo del ochenta y cinco', 'cinco cinco cinco', 'es comercial', 'Aetna', 'ninguna']) {
+  for (const t of ['doce de marzo del ochenta y cinco', 'cinco cinco cinco', 'es comercial']) {
     await say(session, t);
   }
-  await say(session, 'dolor abdominal'); // last field -> sched_window
-  assert.strictEqual(session.turnProfile, 'short', 'sched_window: menu-shaped answer');
+  await say(session, 'Aetna'); // last field -> sched_window
+  assert.strictEqual(session.expectsSpeech, false, 'sched_window: keypad menu');
 
   session.onDtmf(4); // "suggest a date" -> sched_date
-  assert.strictEqual(session.turnProfile, 'open', 'sched_date: spoken date, caller may hesitate');
+  assert.strictEqual(session.expectsSpeech, true, 'sched_date: spoken date, caller may hesitate');
 });
 
-test('turnProfile: short at the slot offer and the confirmation', async () => {
+test('expectsSpeech: false at the caller-ID offer, the slot offer, and the confirmation', async () => {
   const extract = fakeExtract([
-    { field: 'mrnOrPhone', value: { mrn: null, phone: '5559876543' } },
-    { field: 'reason', value: { reason: 'revisión' } },
-    { field: 'slotChoice', value: { choice: 'first' } },
+    { field: 'fullName', value: { first_name: 'José', last_name: 'Luna' } },
+    { field: 'insuranceType', value: { insurance_type: 'commercial', provider: null } },
   ]);
-  patients.createPatient(db, { firstName: 'José', lastName: 'Luna', phone: '5559876543' });
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+15559876543' });
 
   session.start();
   session.onDtmf(2); // follow-up
-  await say(session, 'cinco cinco cinco nueve ocho siete seis cinco cuatro tres');
-  await say(session, 'revisión de rutina');
+  await say(session, 'José Luna');
+  assert.strictEqual(session.state, 'collect_key', 'caller ID present -> keypad phone offer');
+  assert.strictEqual(session.expectsSpeech, false, 'collect_key: keypad question, no STT');
+  session.onDtmf(1); // use the caller-ID number -> read-back
+  session.onDtmf(1); // confirm it
+  await say(session, 'es comercial');
   session.onDtmf(3); // next week -> offer
-  assert.strictEqual(session.turnProfile, 'short', 'offer: "la primera"/"la segunda"');
+  assert.strictEqual(session.expectsSpeech, false, 'offer: keypad choice');
 
-  await session.onTranscript('la primera'); // -> confirm
-  assert.strictEqual(session.turnProfile, 'short', 'confirm: sí/no must stay snappy');
+  session.onDtmf(1); // first slot -> confirm
+  assert.strictEqual(session.expectsSpeech, false, 'confirm: keys 1/2 only');
 });
 
 test('new patient: full path lands patient + appointment + Spanish SMS', async () => {
@@ -133,13 +150,7 @@ test('new patient: full path lands patient + appointment + Spanish SMS', async (
     { field: 'dob', value: { dob: '1985-03-12' } },
     { field: 'phone', value: { phone: '5551234567' } },
     { field: 'insuranceType', value: { insurance_type: 'commercial', provider: null } },
-    { field: 'insurance', value: { provider: 'Aetna', policy_number: 'AB123', group_number: null } },
-    { field: 'allergies', value: { allergies: 'penicilina' }, confidence: 0.8 },
-    // Extracted reason = caller's words minus filler; the verbatim
-    // transcript is stored alongside it (asserted on the row below).
-    { field: 'reason', value: { reason: 'dolor abdominal leve' } },
-    { field: 'slotChoice', value: { choice: 'first' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
+    { field: 'insurance', value: { provider: 'Aetna' }, confidence: 0.8 },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
 
@@ -152,11 +163,9 @@ test('new patient: full path lands patient + appointment + Spanish SMS', async (
   const companyQuestion = await say(session, 'es un seguro comercial, del trabajo');
   assert.deepStrictEqual(playIds(companyQuestion), ['ask_insurance'],
     'commercial type -> commercial company question, no Vital detour, no reminder');
-  await say(session, 'tengo Aetna');
-  await say(session, 'penicilina');
 
   // after last field: broad "when?" question first
-  const windowActions = await say(session, 'eh pues... tengo un dolor abdominal leve');
+  const windowActions = await say(session, 'tengo Aetna');
   assert.deepStrictEqual(playIds(windowActions), ['ask_sched_window']);
 
   // "next week" narrows to concrete slots, offered in Spanish
@@ -164,34 +173,31 @@ test('new patient: full path lands patient + appointment + Spanish SMS', async (
   const offer = offerActions.find((a) => a.type === 'playText');
   assert.match(offer.text, /lunes 27 de julio/);
 
-  const confirmActions = await session.onTranscript('la primera');
+  const confirmActions = session.onDtmf(1); // first slot
   assert.match(confirmActions.find((a) => a.type === 'playText').text, /¿Se la confirmo\?/);
 
-  const finalActions = await session.onTranscript('sí, confirmo');
+  const finalActions = session.onDtmf(1); // 1 = sí
   const sms = finalActions.find((a) => a.type === 'sms');
   assert.strictEqual(sms.to, '5551234567');
   assert.match(sms.text, /cita quedó confirmada/);
   assert.ok(finalActions.some((a) => a.type === 'hangup'));
 
   const patient = db.prepare("SELECT * FROM patients WHERE first_name = 'María'").get();
-  assert.strictEqual(patient.allergies, 'penicilina');
+  assert.strictEqual(patient.insurance_provider, 'Aetna');
   const appt = db.prepare('SELECT * FROM appointments').get();
   assert.strictEqual(appt.patient_type, 'new');
   assert.strictEqual(appt.mrn, patient.mrn);
   assert.strictEqual(appt.scheduled_date, '2026-07-27');
   assert.strictEqual(appt.extraction_confidence, 0.8, 'stores the MINIMUM field confidence');
-  assert.strictEqual(appt.reason, 'dolor abdominal leve', 'clean free-text reason, no category');
-  assert.strictEqual(
-    appt.reason_transcript, 'eh pues... tengo un dolor abdominal leve',
-    'verbatim transcript stored next to the cleaned reason',
-  );
+  assert.strictEqual(appt.reason, null, 'no reason question — column stays NULL');
 });
 
-test('phone with caller ID: "sí" adopts the calling number, read back before kept', async () => {
+// --- phone: keypad caller-ID offer + dictated variant --------------------
+
+test('phone with caller ID: key 1 adopts the calling number, read back before kept', async () => {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
     { field: 'dob', value: { dob: '1938-03-12' } },
-    { field: 'phone', value: { phone: null, use_caller_id: true } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+17875550000' });
   session.start();
@@ -199,23 +205,27 @@ test('phone with caller ID: "sí" adopts the calling number, read back before ke
   await say(session, 'María García');
   const phoneQuestion = await say(session, 'doce de marzo del treinta y ocho');
   assert.deepStrictEqual(playIds(phoneQuestion), ['ask_phone_caller_id'],
-    'caller ID present -> the offer variant, not the dictate-a-number question');
+    'caller ID present -> the keypad offer, not the dictate-a-number question');
+  assert.strictEqual(session.state, 'collect_key');
 
-  const verify = await session.onTranscript('sí, a este mismo número');
+  const verify = session.onDtmf(1);
   assert.strictEqual(session.state, 'verify',
     'the caller-ID number still goes through the read-back, never committed unheard');
   assert.match(readbackText(verify), /7 8 7, 5 5 5, 0 0 0 0/,
     'E.164 caller ID read back as 10-digit national, digit by digit');
+  assert.strictEqual(extract.calls.length, 2, 'accepting the caller ID costs no extraction call');
 
   session.onDtmf(1); // sí
   assert.strictEqual(session.data.phone.phone, '7875550000');
+  assert.strictEqual(session.minConfidence, 0.95,
+    'the keypad-accepted number must not drag minConfidence down');
 });
 
-test('phone with caller ID: dictating a different number still works', async () => {
+test('phone with caller ID: key 2 moves on to dictating a number', async () => {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
     { field: 'dob', value: { dob: '1938-03-12' } },
-    { field: 'phone', value: { phone: '9395551234', use_caller_id: false } },
+    { field: 'phone', value: { phone: '9395551234' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+17875550000' });
   session.start();
@@ -223,18 +233,61 @@ test('phone with caller ID: dictating a different number still works', async () 
   await say(session, 'María García');
   await say(session, 'doce de marzo del treinta y ocho');
 
-  const verify = await session.onTranscript('no, mejor al nueve tres nueve...');
+  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['ask_phone'],
+    'declining the caller ID asks for a dictated number');
+  assert.strictEqual(session.state, 'collect');
+
+  const verify = await session.onTranscript('al nueve tres nueve...');
   assert.match(readbackText(verify), /9 3 9, 5 5 5, 1 2 3 4/);
   session.onDtmf(1);
   assert.strictEqual(session.data.phone.phone, '9395551234');
 });
 
-test('phone without caller ID: plain question, and a bare "sí" re-asks instead of committing nothing', async () => {
+test('an unmapped key at the caller-ID offer replays the question', async () => {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
     { field: 'dob', value: { dob: '1938-03-12' } },
-    // blocked caller ID, but the model still heard an affirmation
-    { field: 'phone', value: { phone: null, use_caller_id: true } },
+  ]);
+  const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+17875550000' });
+  session.start();
+  session.onDtmf(1);
+  await say(session, 'María García');
+  await say(session, 'doce de marzo del treinta y ocho');
+
+  assert.deepStrictEqual(playIds(session.onDtmf(5)), ['ask_phone_caller_id']);
+  assert.strictEqual(session.state, 'collect_key', 'still waiting on 1 or 2');
+});
+
+test('rejecting the caller-ID read-back returns to the keypad offer, where 2 reaches dictation', async () => {
+  const extract = fakeExtract([
+    { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
+    { field: 'dob', value: { dob: '1938-03-12' } },
+  ]);
+  const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+17875550000' });
+  session.start();
+  session.onDtmf(1);
+  await say(session, 'María García');
+  await say(session, 'doce de marzo del treinta y ocho');
+
+  session.onDtmf(1); // use the caller ID -> read-back
+  const retry = session.onDtmf(2); // "no" — that's not the number I want
+  assert.deepStrictEqual(playIds(retry), ['retry_field', 'ask_phone_caller_id']);
+  assert.strictEqual(session.state, 'collect_key',
+    'rejecting the read-back re-asks the KEYPAD question, not a speech listen');
+
+  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['ask_phone'],
+    'from there, 2 still reaches the dictated variant');
+});
+
+test('phone without caller ID: plain dictation question, a failed extraction re-asks forever', async () => {
+  const extract = fakeExtract([
+    { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
+    { field: 'dob', value: { dob: '1938-03-12' } },
+    // a bare "sí" has no digits: the schema rejects it (ok: false)
+    { field: 'phone', ok: false, value: null, confidence: 0 },
+    { field: 'phone', ok: false, value: null, confidence: 0 },
+    { field: 'phone', ok: false, value: null, confidence: 0 },
+    { field: 'phone', ok: false, value: null, confidence: 0 },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
@@ -244,259 +297,344 @@ test('phone without caller ID: plain question, and a bare "sí" re-asks instead 
   assert.deepStrictEqual(playIds(phoneQuestion), ['ask_phone'],
     'no caller ID -> no offer to use one');
 
-  const actions = await session.onTranscript('sí');
-  assert.deepStrictEqual(playIds(actions), ['ask_phone'],
-    'nothing to adopt -> ask for a number outright');
-  assert.strictEqual(session.state, 'collect', 'no read-back of a nonexistent number');
+  for (const t of ['sí', 'sí, a este mismo', 'ese mismo número', 'sí']) {
+    const actions = await session.onTranscript(t);
+    assert.deepStrictEqual(playIds(actions), ['reprompt_generic'],
+      're-prompt every time — there is no attempt cap and no handoff');
+  }
+  assert.strictEqual(session.state, 'collect', 'still asking, never transferred');
+  assert.ok(!session.ended);
   assert.strictEqual(session.data.phone, undefined);
-  assert.strictEqual(session.attempts, 1, 'counts as a strike so it still ends at a human');
 });
 
-test('follow-up: spoken routing, phone lookup, booking against existing MRN', async () => {
+// --- follow-up / post-op paths -------------------------------------------
+
+test('follow-up: name/phone/plan type, booking reuses the matching record', async () => {
   const mrn = patients.createPatient(db, { firstName: 'José', lastName: 'Luna', phone: '5559876543' });
   const extract = fakeExtract([
-    { field: 'patientType', value: { patient_type: 'follow_up' } },
-    { field: 'mrnOrPhone', value: { mrn: null, phone: '5559876543' } },
-    { field: 'reason', value: { reason: 'revisión de rutina' } },
-    { field: 'slotChoice', value: { choice: 'second' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
+    { field: 'fullName', value: { first_name: 'José', last_name: 'Luna' } },
+    { field: 'phone', value: { phone: '5559876543' } },
+    { field: 'insuranceType', value: { insurance_type: 'commercial', provider: null } },
   ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract, menuSpeechEnabled: true });
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
 
-  assert.deepStrictEqual(playIds(await session.onTranscript('vengo a seguimiento')), ['ask_mrn_or_phone']);
-  await say(session, 'mi teléfono es cinco cinco cinco nueve ocho siete seis cinco cuatro tres');
-  await say(session, 'revisión de rutina');
+  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['ask_full_name']);
+  await say(session, 'José Luna');
+  const typeQuestion = await say(session, 'cinco cinco cinco nueve ocho siete seis cinco cuatro tres');
+  assert.deepStrictEqual(playIds(typeQuestion), ['ask_insurance_type']);
+  const sched = await say(session, 'es comercial');
+  assert.deepStrictEqual(playIds(sched), ['ask_sched_window'],
+    'commercial goes straight to scheduling — no reminder, no company question');
   session.onDtmf(3); // next week
-  await session.onTranscript('la segunda opción');
-  await session.onTranscript('sí');
+  session.onDtmf(2); // second slot
+  const final = session.onDtmf(1); // 1 = sí
 
   const appt = db.prepare('SELECT * FROM appointments').get();
-  assert.strictEqual(appt.mrn, mrn);
+  assert.strictEqual(appt.mrn, mrn, 'phone match books against the existing record');
   assert.strictEqual(appt.patient_type, 'follow_up');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM patients').get().n, 1, 'no duplicate row');
+  assert.strictEqual(final.find((a) => a.type === 'sms').to, '5559876543');
 });
 
-test('follow-up: record not found gets its own re-prompt, then human handoff at 3 strikes', async () => {
+test('follow-up Vital caller hears the referido reminder, then scheduling', async () => {
   const extract = fakeExtract([
-    { field: 'mrnOrPhone', value: { mrn: 'P000001', phone: null } },
-    { field: 'mrnOrPhone', value: { mrn: 'P000001', phone: null } },
-    { field: 'mrnOrPhone', value: { mrn: 'P000001', phone: null } },
+    { field: 'fullName', value: { first_name: 'Carmen', last_name: 'Vega' } },
+    { field: 'phone', value: { phone: '7875551234' } },
+    { field: 'insuranceType', value: { insurance_type: 'vital', provider: null } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(2);
+  await say(session, 'Carmen Vega');
+  await say(session, 'siete ocho siete...');
 
-  assert.deepStrictEqual(playIds(await session.onTranscript('P cero cero cero cero cero uno')), ['record_not_found']);
-  assert.deepStrictEqual(playIds(await session.onTranscript('P cero cero cero cero cero uno')), ['record_not_found']);
-  const final = await session.onTranscript('P cero cero cero cero cero uno');
-  assert.deepStrictEqual(playIds(final), ['handoff_human']);
-  assert.strictEqual(final.find((a) => a.type === 'escalate').reason, 'extraction_failure');
-  assert.ok(session.ended);
+  const actions = await say(session, 'de la Reforma');
+  assert.deepStrictEqual(playIds(actions), ['vital_referral_reminder', 'ask_sched_window'],
+    'reminder plays right after the type lands, before the scheduling question');
 });
 
-test('post-op benign path books a follow-up', async () => {
+test('follow-up: unknown phone creates a record with the collected name and plan', async () => {
   const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 3 } },
-    { field: 'slotChoice', value: { choice: 'first' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
+    { field: 'fullName', value: { first_name: 'Carmen', last_name: 'Vega' } },
+    { field: 'phone', value: { phone: '7875551234' } },
+    { field: 'insuranceType', value: { insurance_type: 'vital', provider: 'Triple-S Vital' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
-  session.onDtmf(3);
+  session.onDtmf(2);
+  await say(session, 'Carmen Vega');
+  await say(session, 'siete ocho siete...');
+  await say(session, 'tengo Triple-S Vital');
+  session.onDtmf(3); // next week
+  session.onDtmf(1); // first slot
+  session.onDtmf(1); // sí
+
+  const patient = db.prepare("SELECT * FROM patients WHERE first_name = 'Carmen'").get();
+  assert.strictEqual(patient.phone, '7875551234');
+  assert.strictEqual(patient.insurance_provider, 'Triple-S Vital',
+    'a company named alongside the type lands on the new record');
+  assert.strictEqual(db.prepare('SELECT * FROM appointments').get().mrn, patient.mrn);
+});
+
+test('post-op path: date, hospital, name, phone, then a booking with SMS', async () => {
+  const extract = fakeExtract(postOpFields());
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
+  assert.deepStrictEqual(playIds(session.onDtmf(3)), ['ask_surgery_date']);
 
   await say(session, 'me operaron el veinte de julio');
-  await say(session, 'me siento bien, el dolor es un tres');
+  const nameQuestion = await say(session, 'en el Auxilio Mutuo');
+  assert.deepStrictEqual(playIds(nameQuestion), ['ask_postop_full_name']);
+  await say(session, 'Juan Rivera');
+  await say(session, 'siete ocho siete, cinco cinco cinco, nueve nueve nueve nueve');
   session.onDtmf(3); // next week
-  await session.onTranscript('la primera');
-  await session.onTranscript('sí');
+  session.onDtmf(1); // first slot
+  const final = session.onDtmf(1); // 1 = sí
 
+  const patient = db.prepare("SELECT * FROM patients WHERE first_name = 'Juan'").get();
+  assert.strictEqual(patient.phone, '7875559999');
   const appt = db.prepare('SELECT * FROM appointments').get();
   assert.strictEqual(appt.patient_type, 'post_op');
-  assert.match(appt.reason, /dolor=3/);
+  assert.strictEqual(appt.mrn, patient.mrn);
+  assert.match(appt.reason, /cirugía 2026-07-20/);
+  assert.match(appt.reason, /Auxilio Mutuo/);
+  assert.strictEqual(final.find((a) => a.type === 'sms').to, '7875559999');
 });
 
-test('post-op red flag escalates BEFORE any extraction call and skips scheduling', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-  ]);
+test('post-op booking reuses the record whose phone matches instead of duplicating it', async () => {
+  const mrn = patients.createPatient(db, { firstName: 'Juan', lastName: 'Rivera', phone: '7875559999' });
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-
-  const callsBefore = extract.calls.length;
-  const actions = await session.onTranscript('es que no puedo respirar y estoy sangrando mucho');
-
-  assert.strictEqual(extract.calls.length, callsBefore, 'no LLM call on a red-flag transcript');
-  assert.deepStrictEqual(playIds(actions), ['escalate_red_flag']);
-  const esc = actions.find((a) => a.type === 'escalate');
-  assert.strictEqual(esc.reason, 'red_flag');
-  assert.ok(session.ended, 'call ends — no scheduling after a red flag');
-  assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n, 0);
-});
-
-test('symptom extraction backstop: bleeding=true escalates even when keywords missed', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    // transcript wording slipped past redFlags.js, but the model still
-    // understood it as bleeding — the accept() backstop must catch it
-    { field: 'symptoms', value: { fever: false, bleeding: true, drain_concern: false, pain_level: 4 } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-
-  const actions = await session.onTranscript('se me mancha la venda de rojo todo el tiempo');
-  assert.deepStrictEqual(playIds(actions), ['escalate_red_flag']);
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'symptom_report');
-  assert.ok(session.ended);
-  assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n, 0);
-});
-
-test('symptom extraction backstop: severe pain (>=8) escalates', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 9 } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  const actions = await session.onTranscript('el dolor es un nueve');
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'symptom_report');
-});
-
-test('red flag gate also fires outside the post-op flow', async () => {
-  const extract = fakeExtract([
-    { field: 'fullName', value: { first_name: 'Ana', last_name: 'Ruiz' } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(1);
-  await say(session, 'Ana Ruiz');
-
-  const actions = await session.onTranscript('tengo mucho dolor de pecho desde anoche');
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'red_flag');
-});
-
-test('menu: low-confidence speech re-prompts twice then hands off (speech enabled)', async () => {
-  const extract = fakeExtract([
-    { field: 'patientType', ok: true, value: { patient_type: 'unknown' }, confidence: 0.3 },
-    { field: 'patientType', ok: true, value: { patient_type: 'unknown' }, confidence: 0.3 },
-    { field: 'patientType', ok: true, value: { patient_type: 'unknown' }, confidence: 0.3 },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract, menuSpeechEnabled: true });
-  session.start();
-
-  assert.deepStrictEqual(playIds(await session.onTranscript('eh...')), ['menu_retry']);
-  assert.deepStrictEqual(playIds(await session.onTranscript('mmm')), ['menu_retry']);
-  const final = await session.onTranscript('...');
-  assert.deepStrictEqual(playIds(final), ['handoff_human']);
-  assert.ok(session.ended);
-});
-
-test('referral: unknown caller creates patient + referral rows', async () => {
-  const extract = fakeExtract([
-    { field: 'mrnOrPhone', value: { mrn: null, phone: '5551112222' } },
-    { field: 'authorization', value: { has_authorization: true, authorization_code: 'AUTH42' } },
-    { field: 'referringProvider', value: { provider_name: 'Dr. Soto', fax: '5552223333' } },
-    { field: 'procedureType', value: { procedure: 'colecistectomía' } },
-    { field: 'slotChoice', value: { choice: 'first' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(4);
-
-  await say(session, 'no tengo récord aquí, mi teléfono es...');
-  await say(session, 'sí, autorización AUTH cuarenta y dos');
-  await say(session, 'el doctor Soto');
-  await say(session, 'colecistectomía');
+  await sayPostOpIntake(session);
   session.onDtmf(3); // next week
-  await session.onTranscript('la primera');
-  const final = await session.onTranscript('sí');
+  session.onDtmf(1); // first slot
+  session.onDtmf(1); // sí
 
-  const referralRow = db.prepare('SELECT * FROM referrals').get();
-  assert.strictEqual(referralRow.authorization_code, 'AUTH42');
-  const appt = db.prepare('SELECT * FROM appointments').get();
-  assert.strictEqual(appt.patient_type, 'referral');
-  assert.strictEqual(referralRow.mrn, appt.mrn);
-  assert.strictEqual(final.find((a) => a.type === 'sms').to, '5551112222');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM patients').get().n, 1,
+    'no duplicate patient row for a known phone');
+  assert.strictEqual(db.prepare('SELECT * FROM appointments').get().mrn, mrn);
 });
 
-test('declining offers three times hands off to a human instead of looping', async () => {
+test('post-op caller accepting the caller-ID number is texted there', async () => {
   const extract = fakeExtract([
     { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 2 } },
-    { field: 'yesNo', value: { answer: 'no' } },
-    { field: 'yesNo', value: { answer: 'no' } },
-    { field: 'yesNo', value: { answer: 'no' } },
+    { field: 'hospital', value: { hospital: 'el Hospital Auxilio Mutuo' } },
+    { field: 'fullName', value: { first_name: 'Juan', last_name: 'Rivera' } },
+  ]);
+  const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+17875550000' });
+  session.start();
+  session.onDtmf(3);
+  await say(session, 'me operaron el veinte de julio');
+  await say(session, 'en el Auxilio Mutuo');
+  const phoneQuestion = await say(session, 'Juan Rivera');
+  assert.deepStrictEqual(playIds(phoneQuestion), ['ask_phone_caller_id'],
+    'caller ID present -> the keypad offer, same as the new-patient flow');
+  session.onDtmf(1); // use this number -> read-back
+  session.onDtmf(1); // confirm it
+  session.onDtmf(3); // next week
+  session.onDtmf(1); // first slot
+
+  const final = session.onDtmf(1);
+  assert.strictEqual(final.find((a) => a.type === 'sms').to, '7875550000');
+  assert.ok(playIds(final).includes('booking_confirmed_sms'));
+});
+
+// --- no automatic transfers: failures re-prompt forever -------------------
+// The only transfer left in the whole call is the caller pressing 0.
+
+test('menu is DTMF-only: speech replays the retry forever, never reaching the LLM', async () => {
+  const extract = fakeExtract([]);
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
+
+  for (let i = 0; i < 5; i += 1) {
+    const actions = await session.onTranscript('soy paciente nuevo');
+    assert.deepStrictEqual(playIds(actions), ['menu_retry']);
+    assert.ok(!actions.some((a) => a.type === 'transfer'), 'never transfers on its own');
+  }
+  assert.ok(!session.ended, 'the call is still live');
+  assert.strictEqual(extract.calls.length, 0, 'menu speech is never sent to extraction');
+
+  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_full_name'], 'DTMF still works');
+});
+
+test('low-confidence extraction re-prompts indefinitely — no 3-strike bailout', async () => {
+  const extract = fakeExtract([
+    { field: 'fullName', value: { first_name: '', last_name: '' }, confidence: 0.2 },
+    { field: 'fullName', value: { first_name: '', last_name: '' }, confidence: 0.2 },
+    { field: 'fullName', value: { first_name: '', last_name: '' }, confidence: 0.2 },
+    { field: 'fullName', value: { first_name: '', last_name: '' }, confidence: 0.2 },
+    { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
-  session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'todo bien, dolor dos');
-
-  // round 1: next week -> first slot -> no
-  session.onDtmf(3);
   session.onDtmf(1);
-  const round2 = await session.onTranscript('no, no me sirve');
-  assert.deepStrictEqual(playIds(round2), ['ask_sched_window'], 'declining re-asks the broad question');
 
-  // round 2
-  session.onDtmf(3);
-  session.onDtmf(1);
-  await session.onTranscript('no');
+  for (let i = 0; i < 4; i += 1) {
+    const actions = await session.onTranscript('...');
+    assert.deepStrictEqual(playIds(actions), ['reprompt_generic'],
+      `attempt ${i + 1}: still re-prompting, no handoff`);
+    assert.ok(!session.ended);
+  }
 
-  // round 3: third decline gives up gracefully — and with the no-slot
-  // goodbye, NOT the "couldn't understand you" one: the caller answered
-  // clearly every time.
-  session.onDtmf(3);
+  // the fifth try lands and the call proceeds normally
+  const verify = await session.onTranscript('me llamo María García');
+  assert.strictEqual(readbackText(verify), 'Entendí que su nombre es María García.');
+});
+
+test('read-back rejected over and over keeps re-asking, never ends at a human', async () => {
+  const extract = fakeExtract([
+    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
+    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
+    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
+    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
+    { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
+  ]);
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
   session.onDtmf(1);
-  const final = await session.onTranscript('no');
-  assert.deepStrictEqual(playIds(final), ['slots_none']);
-  assert.strictEqual(final.find((a) => a.type === 'escalate').reason, 'no_acceptable_slot');
+
+  for (let i = 0; i < 4; i += 1) {
+    await session.onTranscript('me llamo María García'); // misheard every time
+    const retry = session.onDtmf(2);
+    assert.deepStrictEqual(playIds(retry), ['retry_field', 'ask_full_name'],
+      `rejection ${i + 1}: re-asks the same question`);
+    assert.ok(!retry.some((a) => a.type === 'transfer'));
+    assert.ok(!session.ended);
+  }
+
+  await session.onTranscript('María García');
+  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_dob'], 'the fifth try commits normally');
+});
+
+test('declining offers keeps looping back to the window question, never transfers', async () => {
+  const extract = fakeExtract(postOpFields());
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
+  session.onDtmf(3);
+  await sayPostOpIntake(session);
+
+  for (let round = 0; round < 4; round += 1) {
+    session.onDtmf(3); // next week -> two-slot offer
+    const back = session.onDtmf(3); // decline both
+    assert.deepStrictEqual(playIds(back), ['sched_retry_hint', 'ask_sched_window'],
+      `round ${round + 1}: decline loops to the window menu with the 0 reminder`);
+    assert.ok(!back.some((a) => a.type === 'transfer'), 'no transfer, ever');
+    assert.ok(!session.ended);
+  }
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n, 0);
 });
 
-test('declining both offered slots ("ninguna") re-asks the window instead of striking', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-    { field: 'slotChoice', value: { choice: 'neither' } },
-  ]);
+test('nothing bookable anywhere: says so, returns to the window menu, no transfer', async () => {
+  // Book out every slot from tomorrow through far past the 60-day nearest
+  // search, so a "next week" request finds nothing at all.
+  for (let d = new Date(2026, 6, 25); d <= new Date(2026, 9, 15); d.setDate(d.getDate() + 1)) {
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    for (const time of appointments.SLOT_TIMES) {
+      appointments.bookAppointment(db, { patientType: 'new', date: iso, time });
+    }
+  }
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
-  session.onDtmf(3); // next week -> two-slot offer
+  await sayPostOpIntake(session);
 
-  const back = await session.onTranscript('ninguna me sirve');
-  assert.deepStrictEqual(playIds(back), ['ask_sched_window'], 'a decline is an answer, not a misfire');
+  const actions = session.onDtmf(3); // next week: empty, and no nearest slot either
+  assert.deepStrictEqual(playIds(actions), ['slots_none', 'ask_sched_window']);
+  assert.ok(!actions.some((a) => a.type === 'transfer'));
+  assert.strictEqual(session.state, 'sched_window');
+  assert.ok(!session.ended);
+});
+
+// --- speech at keypad-only states: replayed, never extracted --------------
+// index.js never calls /stt in these states; the session holds the same
+// contract anyway — a transcript landing here replays the question and
+// costs zero extraction calls (fakeExtract.calls is the proof).
+
+test('speech at the scheduling window replays the keypad menu, no extraction', async () => {
+  const extract = fakeExtract(postOpFields());
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
+  session.onDtmf(3);
+  await sayPostOpIntake(session);
+  const callsBefore = extract.calls.length;
+
+  const actions = await session.onTranscript('mejor la semana que viene');
+  assert.deepStrictEqual(playIds(actions), ['ask_sched_window']);
+  assert.strictEqual(extract.calls.length, callsBefore, 'no schedWindow extraction exists anymore');
   assert.strictEqual(session.state, 'sched_window');
 });
 
-test('DTMF 3 declines a two-slot offer, as the offer copy announces', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+test('speech at the slot offer and the confirmation replays them, no extraction', async () => {
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
+  session.onDtmf(3); // next week -> offer
+  const callsBefore = extract.calls.length;
+
+  const offerReplay = await session.onTranscript('la primera');
+  assert.match(offerReplay.find((a) => a.type === 'playText').text, /Tengo dos opciones/,
+    'the (dynamic) offer itself replays, not a generic re-prompt');
+  assert.strictEqual(session.state, 'offer');
+
+  session.onDtmf(1); // pick the first slot -> confirm
+  const confirmReplay = await session.onTranscript('sí, confirmo');
+  assert.match(confirmReplay.find((a) => a.type === 'playText').text, /¿Se la confirmo\?/,
+    'the slot + question replay so the caller hears the date again');
+  assert.strictEqual(session.state, 'confirm');
+  assert.strictEqual(extract.calls.length, callsBefore, 'no yesNo/slotChoice extraction exists anymore');
+
+  const final = session.onDtmf(1);
+  assert.ok(final.some((a) => a.type === 'hangup'), 'the booking still lands afterwards');
+});
+
+test('speech at the caller-ID offer replays it, no extraction', async () => {
+  const extract = fakeExtract([
+    { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
+    { field: 'dob', value: { dob: '1938-03-12' } },
+  ]);
+  const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '+17875550000' });
+  session.start();
+  session.onDtmf(1);
+  await say(session, 'María García');
+  await say(session, 'doce de marzo del treinta y ocho');
+  assert.strictEqual(session.state, 'collect_key');
+  const callsBefore = extract.calls.length;
+
+  const actions = await session.onTranscript('sí, a este mismo número');
+  assert.deepStrictEqual(playIds(actions), ['ask_phone_caller_id']);
+  assert.strictEqual(extract.calls.length, callsBefore, 'a spoken "sí" is not an answer here');
+  assert.strictEqual(session.state, 'collect_key');
+});
+
+test('onUnexpectedSpeech after the session ended is inert', () => {
+  const session = new CallSession({ db, now: FIXED_NOW, extract: fakeExtract([]) });
+  session.start();
+  session.onDtmf(0);
+  assert.deepStrictEqual(session.onUnexpectedSpeech(), []);
+});
+
+// --- scheduling (keypad) ---------------------------------------------------
+
+test('DTMF 3 declines a two-slot offer, as the offer copy announces', async () => {
+  const extract = fakeExtract(postOpFields());
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
+  session.onDtmf(3);
+  await sayPostOpIntake(session);
 
   const offer = session.onDtmf(3);
   assert.match(offer.find((a) => a.type === 'playText').text, /Si ninguna le conviene, oprima tres/);
-  assert.deepStrictEqual(playIds(session.onDtmf(3)), ['ask_sched_window']);
+  assert.deepStrictEqual(playIds(session.onDtmf(3)), ['sched_retry_hint', 'ask_sched_window']);
 });
 
-test('single-slot offer is a yes/no: spoken "no" and DTMF 2 both decline it', async () => {
+test('single-slot offer is keypad-only: 1 accepts, 2 declines', async () => {
   // leave exactly one slot open next week
   for (const date of ['2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30', '2026-07-31']) {
     for (const time of appointments.SLOT_TIMES) {
@@ -504,54 +642,39 @@ test('single-slot offer is a yes/no: spoken "no" and DTMF 2 both decline it', as
       appointments.bookAppointment(db, { patientType: 'new', date, time });
     }
   }
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-    // the spoken decline goes through yesNo, NOT slotChoice — fakeExtract
-    // asserts the field name, so this line is the proof
-    { field: 'yesNo', value: { answer: 'no' } },
-  ]);
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   const offer = session.onDtmf(3); // next week -> exactly one slot
   const text = offer.find((a) => a.type === 'playText').text;
   assert.match(text, /una cita disponible/);
-  assert.match(text, /Si no le conviene, oprima dos o diga no/);
+  assert.match(text, /Si no le conviene, oprima dos\./);
+  assert.doesNotMatch(text, /diga/, 'no spoken alternative announced');
 
-  const declined = await session.onTranscript('no, ese día no puedo');
-  assert.deepStrictEqual(playIds(declined), ['ask_sched_window']);
-
-  // second round: same single slot, decline with the keypad this time
-  session.onDtmf(3);
-  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['ask_sched_window'],
+  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['sched_retry_hint', 'ask_sched_window'],
     'DTMF 2 declines a single-slot offer');
 });
 
-test('one stray keypress per scheduling question never adds up to a handoff', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+test('a stray keypress replays the question it landed on', async () => {
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
-  session.onDtmf(9); // fumble at the window question -> strike 1 there
-  session.onDtmf(3); // answered -> counter resets
+  assert.deepStrictEqual(playIds(session.onDtmf(9)), ['ask_sched_window'], 'fumble at the window question');
+  session.onDtmf(3); // answered
 
-  session.onDtmf(9); // fumble at the offer -> strike 1 there
+  session.onDtmf(9); // fumble at the offer — replays the offer text
   session.onDtmf(1); // pick the first slot
 
   const replay = session.onDtmf(9); // fumble at the confirmation
   assert.match(replay.find((a) => a.type === 'playText').text, /¿Se la confirmo\?/,
-    'confirmation strike replays the slot, not "¿podría repetirlo?"');
-  assert.ok(!session.ended, 'three separate one-off fumbles must not end the call');
+    'confirmation fumble replays the slot, not "¿podría repetirlo?"');
+  assert.ok(!session.ended, 'fumbles never end the call');
 
   const final = session.onDtmf(1);
   assert.ok(final.some((a) => a.type === 'hangup'), 'the booking still lands');
@@ -560,16 +683,14 @@ test('one stray keypress per scheduling question never adds up to a handoff', as
 
 test('a suggested date in the past explains itself and re-asks for a date', async () => {
   const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
+    ...postOpFields(),
     { field: 'preferredDate', value: { date: '2026-07-01' } },
     { field: 'preferredDate', value: { date: '2026-07-29' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   session.onDtmf(4);
   const past = await session.onTranscript('el primero de julio');
@@ -580,183 +701,129 @@ test('a suggested date in the past explains itself and re-asks for a date', asyn
 });
 
 test('a week-wide window offers two different days, not two times the same morning', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   const text = session.onDtmf(3).find((a) => a.type === 'playText').text;
   assert.match(text, /lunes 27 de julio/);
   assert.match(text, /martes 28 de julio/, 'second option comes from a different day');
 });
 
-test('booking with no number to text says the slot aloud instead of promising an SMS', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
-  // post-op finalize sets smsPhone: null, and no callerPhone here either
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
-  session.onDtmf(3);
-  session.onDtmf(1);
-
-  const final = session.onDtmf(1);
-  assert.ok(!final.some((a) => a.type === 'sms'), 'no number, no SMS action');
-  assert.ok(!playIds(final).includes('booking_confirmed_sms'), 'and no SMS promise');
-  assert.match(final.find((a) => a.type === 'playText').text,
-    /quedó confirmada para el lunes 27 de julio a las nueve de la mañana/);
-  assert.ok(final.some((a) => a.type === 'hangup'));
-});
-
-test('post-op booking texts the caller-ID number when there is one', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract, callerPhone: '7875550000' });
-  session.start();
-  session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
-  session.onDtmf(3);
-  session.onDtmf(1);
-
-  const final = session.onDtmf(1);
-  assert.strictEqual(final.find((a) => a.type === 'sms').to, '7875550000');
-  assert.ok(playIds(final).includes('booking_confirmed_sms'));
-});
-
 test('DTMF works end-to-end in scheduling: window, slot, confirmation', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   session.onDtmf(3); // window: next week
   session.onDtmf(2); // second slot
   const final = session.onDtmf(1); // 1 = sí
   assert.ok(final.some((a) => a.type === 'hangup'));
+  assert.ok(final.some((a) => a.type === 'calendarSync'),
+    'a booking nudges the calendar mirror');
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n, 1);
 });
 
-test('window with no availability re-asks instead of dead-ending', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+test('window with no availability proposes the next available slot', async () => {
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   // Friday caller asking for "esta semana": only Sat/Sun remain -> nothing
+  // in the window, so the nearest slot after it (Monday) is offered.
   const noSlots = session.onDtmf(2);
-  assert.deepStrictEqual(playIds(noSlots), ['slots_none_window', 'ask_sched_window']);
+  assert.deepStrictEqual(playIds(noSlots), ['slots_none_window'],
+    'a multi-day window keeps the plural "esas fechas" prompt');
+  assert.match(noSlots.find((a) => a.type === 'playText').text,
+    /La próxima cita disponible es el lunes 27 de julio/);
 
-  const offer = session.onDtmf(3); // next week works
-  assert.ok(offer.some((a) => a.type === 'playText'));
+  // Declining the proposal goes back to the window question.
+  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['sched_retry_hint', 'ask_sched_window']);
+});
+
+test('fully-booked single day says "ese día" and books the proposed nearest slot', async () => {
+  // Book out today (Friday) entirely; Monday 9:00 becomes the nearest slot.
+  for (const time of appointments.SLOT_TIMES) {
+    appointments.bookAppointment(db, { patientType: 'new', date: '2026-07-24', time });
+  }
+  const extract = fakeExtract(postOpFields());
+  const session = new CallSession({ db, now: FIXED_NOW, extract });
+  session.start();
+  session.onDtmf(3);
+  await sayPostOpIntake(session);
+
+  const noSlots = session.onDtmf(1); // hoy -> fully booked
+  assert.deepStrictEqual(playIds(noSlots), ['slots_none_day'],
+    'a single day gets the singular "ese día" prompt, not "esas fechas"');
+  assert.match(noSlots.find((a) => a.type === 'playText').text,
+    /La próxima cita disponible es el lunes 27 de julio a las nueve de la mañana/);
+
+  // Accepting the proposal runs through the normal confirm -> book path.
+  session.onDtmf(1);
+  const final = session.onDtmf(1);
+  assert.ok(final.some((a) => a.type === 'hangup'));
+  const appt = db.prepare("SELECT * FROM appointments WHERE patient_type = 'post_op'").get();
+  assert.strictEqual(appt.scheduled_date, '2026-07-27');
+  assert.strictEqual(appt.scheduled_time, '09:00');
 });
 
 test('"today" window offers same-day slots', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   const offer = session.onDtmf(1); // hoy (Friday, 8am -> 09:00 and 11:00 offered)
   assert.match(offer.find((a) => a.type === 'playText').text, /viernes 24 de julio/);
 });
 
-test('spoken window choice works via schedWindow extraction', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-    { field: 'schedWindow', value: { window: 'next_week', date: null } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
-
-  const offer = await session.onTranscript('mejor la semana que viene');
-  assert.match(offer.find((a) => a.type === 'playText').text, /lunes 27 de julio/);
-});
-
 test('suggesting a date: DTMF 4 asks for it, spoken date narrows to that day', async () => {
   const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
+    ...postOpFields(),
     { field: 'preferredDate', value: { date: '2026-07-29' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
 
   assert.deepStrictEqual(playIds(session.onDtmf(4)), ['ask_preferred_date']);
   const offer = await session.onTranscript('el miércoles que viene');
   assert.match(offer.find((a) => a.type === 'playText').text, /miércoles 29 de julio/);
 
   session.onDtmf(1); // first slot that day
-  const final = await session.onTranscript('sí, confirmo');
+  const final = session.onDtmf(1); // 1 = sí
   assert.ok(final.some((a) => a.type === 'hangup'));
   const appt = db.prepare('SELECT * FROM appointments').get();
   assert.strictEqual(appt.scheduled_date, '2026-07-29');
 });
 
-test('menu speech disabled (default): spoken choice never reaches the LLM, DTMF still works', async () => {
-  const extract = fakeExtract([]);
+test('keys at the spoken-date question replay it — keys do not encode a date', async () => {
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
+  session.onDtmf(3);
+  await sayPostOpIntake(session);
+  session.onDtmf(4); // -> sched_date
 
-  const actions = await session.onTranscript('soy paciente nuevo');
-  assert.deepStrictEqual(playIds(actions), ['menu_retry']);
-  assert.strictEqual(extract.calls.length, 0, 'no extraction call at a DTMF-only menu');
-
-  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_full_name']);
+  assert.deepStrictEqual(playIds(session.onDtmf(7)), ['ask_preferred_date']);
+  assert.strictEqual(session.state, 'sched_date', 'still waiting on the spoken date');
 });
 
-test('menu speech disabled: red-flag gate still runs on menu speech', async () => {
-  const extract = fakeExtract([]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-
-  const actions = await session.onTranscript('me duele el pecho muy fuerte');
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'red_flag');
-  assert.strictEqual(extract.calls.length, 0);
-});
+// --- * = start over --------------------------------------------------------
 
 test('* returns to the main menu mid-flow and clears everything collected', async () => {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'Ana', last_name: 'Ruiz' } },
     // after the reset: post-op path
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 2 } },
-    { field: 'slotChoice', value: { choice: 'first' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
+    ...postOpFields(),
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
@@ -770,28 +837,25 @@ test('* returns to the main menu mid-flow and clears everything collected', asyn
   assert.strictEqual(session.pending, null, 'unconfirmed answer discarded too');
 
   session.onDtmf(3); // switch to post-op
-  await say(session, 'el veinte de julio');
-  await say(session, 'todo bien, dolor dos');
+  await sayPostOpIntake(session);
   session.onDtmf(3); // next week
-  await session.onTranscript('la primera');
-  await session.onTranscript('sí');
+  session.onDtmf(1); // first slot
+  session.onDtmf(1); // sí
 
   const appt = db.prepare('SELECT * FROM appointments').get();
   assert.strictEqual(appt.patient_type, 'post_op');
-  assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM patients').get().n, 0,
+  // The completed post-op booking creates its own patient row (Juan); the
+  // abandoned new-patient path must have left nothing behind.
+  assert.strictEqual(db.prepare("SELECT COUNT(*) AS n FROM patients WHERE first_name = 'Ana'").get().n, 0,
     'abandoned new-patient path created no record');
 });
 
 test('* works from anywhere in scheduling too', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
+  const extract = fakeExtract(postOpFields());
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
   session.onDtmf(3);
-  await say(session, 'el veinte de julio');
-  await say(session, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(session);
   assert.strictEqual(session.state, 'sched_window');
 
   session.onDtmf(3); // into the concrete offer
@@ -803,7 +867,7 @@ test('* works from anywhere in scheduling too', async () => {
 // --- 0 = a human -------------------------------------------------------
 // The clinic's callers are mostly elderly; a caller who wants a person must
 // be able to get one from any point in the call, without having to work out
-// which state the IVR thinks it's in.
+// which state the IVR thinks it's in. This is the ONLY transfer in the call.
 
 test('0 hands off to the scheduling team from the main menu', () => {
   const session = new CallSession({ db, now: FIXED_NOW, extract: fakeExtract([]) });
@@ -811,7 +875,7 @@ test('0 hands off to the scheduling team from the main menu', () => {
 
   const actions = session.onDtmf(0);
   assert.deepStrictEqual(playIds(actions), ['handoff_operator']);
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'caller_request');
+  assert.strictEqual(actions.find((a) => a.type === 'transfer').reason, 'caller_request');
   assert.ok(session.ended);
 });
 
@@ -834,24 +898,16 @@ test('0 works mid-collection, at a read-back, and inside scheduling — and book
   assert.strictEqual(session.state, 'verify');
   const actions = session.onDtmf(0);
   assert.deepStrictEqual(playIds(actions), ['handoff_operator']);
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'caller_request');
+  assert.strictEqual(actions.find((a) => a.type === 'transfer').reason, 'caller_request');
   assert.ok(session.ended);
   assert.deepStrictEqual(session.data, {}, 'nothing collected is stored on a bail-out');
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM patients').get().n, 0);
 
   // inside scheduling
-  const sched = new CallSession({
-    db,
-    now: FIXED_NOW,
-    extract: fakeExtract([
-      { field: 'surgeryDate', value: { date: '2026-07-20' } },
-      { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-    ]),
-  });
+  const sched = new CallSession({ db, now: FIXED_NOW, extract: fakeExtract(postOpFields()) });
   sched.start();
   sched.onDtmf(3);
-  await say(sched, 'el veinte de julio');
-  await say(sched, 'sin síntomas, dolor uno');
+  await sayPostOpIntake(sched);
   sched.onDtmf(3); // at the slot offer
   assert.deepStrictEqual(playIds(sched.onDtmf(0)), ['handoff_operator']);
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n, 0);
@@ -890,24 +946,45 @@ test('each answer is read back in Spanish and only stored once confirmed', async
   assert.strictEqual(readbackText(dobReadback), 'Entendí que nació el 12 de marzo de 1938.');
 });
 
-test('a spoken "sí" confirms the read-back the same way the keypad does', async () => {
+// Reaches the first read-back of the new-patient flow: "Entendí que su
+// nombre es María García. ¿Es correcto?" now playing.
+async function sessionAtNameReadback(extraScript = []) {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
+    ...extraScript,
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
-  session.onDtmf(1);
+  session.onDtmf(1); // new patient
   await session.onTranscript('me llamo María García');
+  assert.strictEqual(session.state, 'verify');
+  return { session, extract };
+}
 
-  assert.deepStrictEqual(playIds(await session.onTranscript('sí, correcto')), ['ask_dob']);
-  assert.strictEqual(session.data.fullName.last_name, 'García');
+test('a spoken sí/no at the read-back replays it — confirmations are keypad-only', async () => {
+  const { session, extract } = await sessionAtNameReadback();
+  const callsBefore = extract.calls.length;
+
+  for (const t of ['sí, es correcto', 'no, está mal', 'Gracias.']) {
+    const actions = await session.onTranscript(t);
+    assert.strictEqual(readbackText(actions), 'Entendí que su nombre es María García.',
+      'the read-back sentence itself replays');
+    assert.deepStrictEqual(playIds(actions), ['confirm_field'], 'key instructions replay too');
+    assert.strictEqual(session.state, 'verify', 'still waiting on a keypress');
+  }
+  assert.strictEqual(extract.calls.length, callsBefore,
+    'no extraction spent on speech that cannot be accepted');
+  assert.strictEqual(session.data.fullName, undefined, 'nothing committed');
+  assert.ok(session.pending, 'nothing discarded either — a spoken "no" must not guess');
+
+  // the keys still do their job
+  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_dob']);
+  assert.deepStrictEqual(session.data.fullName, { first_name: 'María', last_name: 'García' });
 });
 
-test('rejecting a read-back re-asks the same question and drops the wrong value', async () => {
+test('rejecting a read-back (key 2) re-asks the same question and drops the wrong value', async () => {
   const extract = fakeExtract([
     { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
-    { field: 'yesNo', value: { answer: 'no' } },
     { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
@@ -915,7 +992,7 @@ test('rejecting a read-back re-asks the same question and drops the wrong value'
   session.onDtmf(1);
   await session.onTranscript('me llamo María García'); // misheard
 
-  const retry = await session.onTranscript('no, así no es');
+  const retry = session.onDtmf(2);
   assert.deepStrictEqual(playIds(retry), ['retry_field', 'ask_full_name']);
   assert.strictEqual(session.state, 'collect');
   assert.deepStrictEqual(session.data, {}, 'the rejected value is gone');
@@ -925,116 +1002,12 @@ test('rejecting a read-back re-asks the same question and drops the wrong value'
   assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_dob']);
 });
 
-test('read-back rejected three times ends at a human, not a loop', async () => {
-  const extract = fakeExtract([
-    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
-    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
-    { field: 'fullName', value: { first_name: 'Marta', last_name: 'Arce' } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(1);
-
-  await session.onTranscript('me llamo María García');
-  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['retry_field', 'ask_full_name']);
-  await session.onTranscript('me llamo María García');
-  assert.deepStrictEqual(playIds(session.onDtmf(2)), ['retry_field', 'ask_full_name']);
-  await session.onTranscript('me llamo María García');
-
-  const final = session.onDtmf(2);
-  assert.deepStrictEqual(playIds(final), ['handoff_human']);
-  assert.strictEqual(final.find((a) => a.type === 'escalate').reason, 'extraction_failure');
-  assert.ok(session.ended);
-});
-
-test('an unintelligible answer at a read-back replays it instead of re-asking the question', async () => {
-  const extract = fakeExtract([
-    { field: 'fullName', value: { first_name: 'María', last_name: 'García' } },
-    { field: 'yesNo', ok: true, value: { answer: 'yes' }, confidence: 0.2 },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(1);
-  await session.onTranscript('me llamo María García');
-
-  const replay = await session.onTranscript('mmm...');
+test('an unmapped key at the read-back replays it instead of guessing', async () => {
+  const { session } = await sessionAtNameReadback();
+  const replay = session.onDtmf(7);
   assert.strictEqual(readbackText(replay), 'Entendí que su nombre es María García.');
   assert.deepStrictEqual(playIds(replay), ['confirm_field']);
-  assert.strictEqual(session.state, 'verify', 'still waiting on the same sí/no');
-});
-
-// Regression: a barge-in fragment transcribed as "Gracias." used to come
-// back {yes: false} at high confidence — the forced boolean made the model
-// guess — silently discarding a phone number the caller had gotten right.
-test('a confident non-answer at a read-back ("Gracias.") replays it instead of guessing no', async () => {
-  const extract = fakeExtract([
-    { field: 'fullName', value: { first_name: 'José', last_name: 'González' } },
-    { field: 'dob', value: { dob: '1973-09-08' } },
-    { field: 'phone', value: { phone: '7874030123' } },
-    { field: 'yesNo', value: { answer: 'unknown' }, confidence: 0.95 },
-    { field: 'yesNo', value: { answer: 'yes' } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(1); // new patient
-  await say(session, 'José González');
-  await say(session, 'septiembre 8 del 73');
-  await session.onTranscript('al 787-403-0123');
-  assert.strictEqual(session.state, 'verify');
-
-  const replay = await session.onTranscript('Gracias.');
-  assert.match(readbackText(replay), /su teléfono es 7 8 7, 4 0 3, 0 1 2 3/,
-    'the read-back is replayed — the value is neither committed nor discarded');
-  assert.strictEqual(session.state, 'verify');
-  assert.strictEqual(session.data.phone, undefined, 'not committed yet');
-  assert.ok(session.pending, 'not discarded either');
-
-  // a real "sí" then commits the value that nearly got thrown away
-  await session.onTranscript('Sí, estaba bien.');
-  assert.strictEqual(session.data.phone.phone, '7874030123');
-});
-
-// Voice barge-in must stay off while a read-back or the slot confirmation
-// is playing: this caller base backchannels over prompts, and cancelling
-// the read-back mid-number defeats its purpose. index.js consults this
-// before running onset detection. (The keypad still interrupts — the dtmf
-// event path doesn't check it.)
-test('bargeInAllowed: off in verify and confirm, on everywhere else', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-    { field: 'symptoms', value: { fever: false, bleeding: false, drain_concern: false, pain_level: 1 } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  assert.strictEqual(session.bargeInAllowed, true, 'menu: greeting is skippable');
-
-  session.onDtmf(3);
-  assert.strictEqual(session.bargeInAllowed, true, 'collect: questions are skippable');
-  await session.onTranscript('el veinte de julio');
-  assert.strictEqual(session.bargeInAllowed, false, 'verify: the read-back must play out');
-  session.onDtmf(1);
-  await say(session, 'sin síntomas, dolor uno');
-
-  session.onDtmf(3); // window -> offer
-  assert.strictEqual(session.bargeInAllowed, true, 'offer: slot menu is skippable');
-  session.onDtmf(1); // -> confirm
-  assert.strictEqual(session.bargeInAllowed, false, 'confirm: the slot sentence must play out');
-});
-
-test('red-flag gate still runs while a read-back is pending', async () => {
-  const extract = fakeExtract([
-    { field: 'surgeryDate', value: { date: '2026-07-20' } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(3);
-  await session.onTranscript('el veinte de julio');
-  assert.strictEqual(session.state, 'verify');
-
-  const callsBefore = extract.calls.length;
-  const actions = await session.onTranscript('sí, pero es que no puedo respirar');
-  assert.strictEqual(extract.calls.length, callsBefore, 'no LLM call on a red-flag transcript');
-  assert.strictEqual(actions.find((a) => a.type === 'escalate').reason, 'red_flag');
+  assert.strictEqual(session.state, 'verify', 'still waiting on 1 or 2');
 });
 
 test('read-backs are Spanish and speak digits one at a time', () => {
@@ -1045,38 +1018,18 @@ test('read-backs are Spanish and speak digits one at a time', () => {
     'Entendí que su teléfono es 7 8 7, 4 9 0, 2 0 8 1.',
   );
   assert.strictEqual(
-    fieldReadbackText('mrnOrPhone', { mrn: 'p000123', phone: null }),
-    'Entendí que su número de récord es P 0 0 0 1 2 3.',
-  );
-  assert.strictEqual(
-    fieldReadbackText('allergies', { allergies: 'ninguna' }),
-    'Entendí que no tiene alergia a ningún medicamento.',
-  );
-  assert.strictEqual(
-    fieldReadbackText('allergies', { allergies: 'penicilina' }),
-    'Entendí que tiene alergia a penicilina.',
-  );
-  assert.strictEqual(
     fieldReadbackText('surgeryDate', { date: '2026-07-20' }),
     'Entendí que su operación fue el 20 de julio de 2026.',
   );
-  assert.match(
-    fieldReadbackText('symptoms', { fever: false, bleeding: false, drain_concern: false, pain_level: 3 }),
-    /no tiene fiebre, no tiene sangrado, .* dolor es de 3 de diez\.$/,
-  );
   assert.strictEqual(
-    fieldReadbackText('authorization', { has_authorization: false, authorization_code: null }),
-    'Entendí que todavía no tiene la autorización de su plan médico.',
-  );
-  assert.match(
-    fieldReadbackText('authorization', { has_authorization: true, authorization_code: 'AUTH42' }),
-    /número A U T H 4 2\.$/,
+    fieldReadbackText('hospital', { hospital: 'el Hospital Auxilio Mutuo' }),
+    'Entendí que su operación fue en el Hospital Auxilio Mutuo.',
   );
 
   // A field with no formatter, or a value that can't be formatted, yields
   // null — the session then keeps the answer instead of asking a question
   // the caller never heard.
-  assert.strictEqual(fieldReadbackText('slotChoice', { choice: 1 }), null);
+  assert.strictEqual(fieldReadbackText('unknownField', { anything: 1 }), null);
   assert.strictEqual(fieldReadbackText('fullName', {}), null);
 });
 
@@ -1088,14 +1041,8 @@ test('every collected field has a read-back — a silent field is a silent mis-t
     phone: { phone: '7875551234' },
     insuranceType: { insurance_type: 'vital', provider: null },
     insurance: { provider: 'Triple-S' },
-    allergies: { allergies: 'ninguna' },
-    reason: { reason: 'dolor abdominal' },
-    mrnOrPhone: { mrn: 'P000001', phone: null },
     surgeryDate: { date: '2026-07-20' },
-    symptoms: { fever: false, bleeding: false, drain_concern: false, pain_level: 2 },
-    authorization: { has_authorization: true, authorization_code: 'AUTH42' },
-    referringProvider: { provider_name: 'el doctor Soto' },
-    procedureType: { procedure: 'colecistectomía' },
+    hospital: { hospital: 'el Hospital Auxilio Mutuo' },
   };
   for (const flow of Object.values(FLOWS)) {
     for (const step of flow.steps) {
@@ -1136,7 +1083,7 @@ test('Plan Vital path: Vital company question, then the referral reminder', asyn
   // company confirmed -> reminder plays BEFORE the next question
   await session.onTranscript('Triple-S');
   const afterCompany = session.onDtmf(1);
-  assert.deepStrictEqual(playIds(afterCompany), ['vital_referral_reminder', 'ask_allergies']);
+  assert.deepStrictEqual(playIds(afterCompany), ['vital_referral_reminder', 'ask_sched_window']);
 });
 
 test('commercial full call never plays the Vital referral reminder', async () => {
@@ -1146,8 +1093,6 @@ test('commercial full call never plays the Vital referral reminder', async () =>
     { field: 'phone', value: { phone: '5551234567' } },
     { field: 'insuranceType', value: { insurance_type: 'commercial', provider: null } },
     { field: 'insurance', value: { provider: 'MCS' } },
-    { field: 'allergies', value: { allergies: 'ninguna' } },
-    { field: 'reason', value: { reason: 'consulta' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
@@ -1155,7 +1100,7 @@ test('commercial full call never plays the Vital referral reminder', async () =>
 
   const played = [];
   for (const t of ['María García', 'doce de marzo del ochenta y cinco', 'cinco cinco cinco',
-    'es comercial', 'MCS', 'ninguna', 'una consulta']) {
+    'es comercial', 'MCS']) {
     played.push(...playIds(await say(session, t)));
   }
   assert.ok(!played.includes('vital_referral_reminder'),
@@ -1170,10 +1115,6 @@ test('company named with the type ("MCS ClassiCare") skips the company question'
     { field: 'dob', value: { dob: '1948-11-30' } },
     { field: 'phone', value: { phone: '7875550000' } },
     { field: 'insuranceType', value: { insurance_type: 'commercial', provider: 'MCS ClassiCare' } },
-    { field: 'allergies', value: { allergies: 'ninguna' } },
-    { field: 'reason', value: { reason: 'consulta' } },
-    { field: 'slotChoice', value: { choice: 'first' } },
-    { field: 'yesNo', value: { answer: 'yes' } },
   ]);
   const session = new CallSession({ db, now: FIXED_NOW, extract });
   session.start();
@@ -1186,14 +1127,12 @@ test('company named with the type ("MCS ClassiCare") skips the company question'
   const typeReadback = await session.onTranscript('es MCS ClassiCare');
   assert.strictEqual(readbackText(typeReadback),
     'Entendí que su plan médico es MCS ClassiCare, un plan comercial.');
-  // ...and confirming it jumps straight to allergies, no company question
-  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_allergies']);
+  // ...and confirming it jumps straight to scheduling, no company question
+  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_sched_window']);
 
-  await say(session, 'ninguna');
-  await say(session, 'una consulta');
-  session.onDtmf(3);
-  await session.onTranscript('la primera');
-  await session.onTranscript('sí');
+  session.onDtmf(3); // next week
+  session.onDtmf(1); // first slot
+  session.onDtmf(1); // sí
 
   const patient = db.prepare("SELECT * FROM patients WHERE first_name = 'Luis'").get();
   assert.strictEqual(patient.insurance_provider, 'MCS ClassiCare',
@@ -1217,7 +1156,7 @@ test('Vital company named with the type: reminder plays, company question skippe
   const typeReadback = await session.onTranscript('tengo Triple-S Vital');
   assert.strictEqual(readbackText(typeReadback),
     'Entendí que su plan médico es Triple-S Vital, del Plan Vital.');
-  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['vital_referral_reminder', 'ask_allergies']);
+  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['vital_referral_reminder', 'ask_sched_window']);
 });
 
 test('ambiguous carrier ("Triple-S") gets a clarification, and the company is not re-asked', async () => {
@@ -1245,99 +1184,7 @@ test('ambiguous carrier ("Triple-S") gets a clarification, and the company is no
   assert.strictEqual(readbackText(typeReadback),
     'Entendí que su plan médico es Triple-S, del Plan Vital.',
     'the company said before the clarification carries over');
-  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['vital_referral_reminder', 'ask_allergies']);
-});
-
-// --- optional intake questions (ASK_ALLERGIES / ASK_REASON) -------------
-// Deployment switches, read at call time — no module reload needed, but
-// each test must restore the env so the rest of the suite runs with the
-// questions on (the default).
-
-test('ASK_ALLERGIES=false and ASK_REASON=false skip both questions and book with NULLs', async () => {
-  process.env.ASK_ALLERGIES = 'false';
-  process.env.ASK_REASON = 'false';
-  try {
-    const extract = fakeExtract([
-      { field: 'fullName', value: { first_name: 'Elena', last_name: 'Cruz' } },
-      { field: 'dob', value: { dob: '1946-04-02' } },
-      { field: 'phone', value: { phone: '7875553333' } },
-      { field: 'insuranceType', value: { insurance_type: 'commercial', provider: null } },
-      { field: 'insurance', value: { provider: 'Humana' } },
-      { field: 'slotChoice', value: { choice: 'first' } },
-      { field: 'yesNo', value: { answer: 'yes' } },
-    ]);
-    const session = new CallSession({ db, now: FIXED_NOW, extract });
-    session.start();
-    session.onDtmf(1);
-    await say(session, 'Elena Cruz');
-    await say(session, 'dos de abril del cuarenta y seis');
-    await say(session, 'siete ocho siete...');
-    await say(session, 'comercial');
-
-    // company confirmed -> straight to scheduling, no allergies/reason turns
-    await session.onTranscript('Humana');
-    assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_sched_window']);
-
-    session.onDtmf(3); // next week
-    await session.onTranscript('la primera');
-    await session.onTranscript('sí');
-
-    const patient = db.prepare("SELECT * FROM patients WHERE first_name = 'Elena'").get();
-    assert.strictEqual(patient.allergies, null, 'skipped question stores NULL, not a stub');
-    const appt = db.prepare('SELECT * FROM appointments').get();
-    assert.strictEqual(appt.reason, null);
-    assert.strictEqual(appt.reason_transcript, null);
-  } finally {
-    delete process.env.ASK_ALLERGIES;
-    delete process.env.ASK_REASON;
-  }
-});
-
-test('ASK_REASON=false also skips the follow-up reason question', async () => {
-  process.env.ASK_REASON = 'false';
-  try {
-    const mrn = patients.createPatient(db, { firstName: 'José', lastName: 'Luna', phone: '5559876543' });
-    const extract = fakeExtract([
-      { field: 'mrnOrPhone', value: { mrn: null, phone: '5559876543' } },
-    ]);
-    const session = new CallSession({ db, now: FIXED_NOW, extract });
-    session.start();
-    session.onDtmf(2);
-
-    // record found + confirmed -> scheduling directly, no reason question
-    await session.onTranscript('cinco cinco cinco nueve ocho siete seis cinco cuatro tres');
-    assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_sched_window']);
-
-    session.onDtmf(3);
-    session.onDtmf(1);
-    session.onDtmf(1);
-    const appt = db.prepare('SELECT * FROM appointments').get();
-    assert.strictEqual(appt.mrn, mrn);
-    assert.strictEqual(appt.reason, null);
-  } finally {
-    delete process.env.ASK_REASON;
-  }
-});
-
-test('the switches default to asking (no env var set)', async () => {
-  assert.strictEqual(process.env.ASK_ALLERGIES, undefined);
-  assert.strictEqual(process.env.ASK_REASON, undefined);
-  const extract = fakeExtract([
-    { field: 'fullName', value: { first_name: 'Iris', last_name: 'Colón' } },
-    { field: 'dob', value: { dob: '1953-08-21' } },
-    { field: 'phone', value: { phone: '7875554444' } },
-    { field: 'insuranceType', value: { insurance_type: 'commercial', provider: 'Humana' } },
-  ]);
-  const session = new CallSession({ db, now: FIXED_NOW, extract });
-  session.start();
-  session.onDtmf(1);
-  await say(session, 'Iris Colón');
-  await say(session, 'veintiuno de agosto del cincuenta y tres');
-  await say(session, 'siete ocho siete...');
-
-  await session.onTranscript('Humana, comercial');
-  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['ask_allergies'],
-    'with nothing set in .env the allergies question is still asked');
+  assert.deepStrictEqual(playIds(session.onDtmf(1)), ['vital_referral_reminder', 'ask_sched_window']);
 });
 
 test('spanishDate formatting used in offers is correct Spanish', () => {

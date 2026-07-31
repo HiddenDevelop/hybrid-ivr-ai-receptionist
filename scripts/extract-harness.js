@@ -19,52 +19,34 @@ const BARE_CASES = [
   ['dob', 'doce de marzo de mil novecientos ochenta y cinco', (v) => v.dob === '1985-03-12'],
   ['phone', 'siete ocho siete cuatro cero tres cero uno dos tres', (v) => String(v.phone).replace(/\D/g, '') === '7874030123'],
   ['insurance', 'triple ese', (v) => /triple/i.test(v.provider)],
-  ['allergies', 'penicilina', (v) => /penicilina/i.test(v.allergies)],
-  ['reason', 'dolor en el abdomen', (v) => v.reason.length > 0],
   ['surgeryDate', 'veinte de julio', (v) => /-07-20$/.test(v.date || '')],
-  ['schedWindow', 'la semana que viene', (v) => v.window === 'next_week'],
   ['preferredDate', 'cinco de agosto', (v) => /-08-05$/.test(v.date || '')],
-  ['slotChoice', 'la segunda', (v) => v.choice === 'second'],
-  ['yesNo', 'sí', (v) => v.answer === 'yes'],
-  ['referringProvider', 'doctor Soto', (v) => /soto/i.test(v.provider_name)],
 ];
 
-// A lone surname is NOT a full name: it must re-prompt, not write a patient
-// row with a blank first name. Expected to come back not-confident/invalid.
+// Answers that must NOT be accepted. A lone surname is not a full name: it
+// must re-prompt, not write a patient row with a blank first name. And a
+// bare affirmation is not a phone number: the caller-ID offer is a keypad
+// question now, so by the time the phone schema runs the caller is
+// dictating digits — the model must never fabricate them from a "sí".
 const MUST_REJECT = [
   ['fullName', 'Soto'],
+  ['phone', 'sí, a este mismo número'],
 ];
 
 const CASES = [
   ...BARE_CASES,
-  ['patientType', 'soy paciente nuevo, nunca he venido', (v) => v.patient_type === 'new'],
-  ['patientType', 'me operaron la semana pasada aquí', (v) => v.patient_type === 'post_op'],
   ['fullName', 'me llamo María Guadalupe Hernández', (v) => /mar/i.test(v.first_name)],
   ['dob', 'nací el doce de marzo de mil novecientos ochenta y cinco', (v) => v.dob === '1985-03-12'],
   ['phone', 'mi número es cinco cinco cinco, uno dos tres, cuatro cinco seis siete', (v) => String(v.phone).replace(/\D/g, '').endsWith('5551234567')],
   ['insurance', 'tengo Aetna, la póliza es A B uno dos tres', (v) => /aetna/i.test(v.provider)],
   ['insurance', 'tengo triple ese', (v) => /triple/i.test(v.provider)],
   ['insurance', 'mi plan es MCS, no tengo el número a mano', (v) => /mcs/i.test(v.provider)],
-  ['allergies', 'soy alérgica a la penicilina', (v) => /penicilina/i.test(v.allergies)],
-  ['allergies', 'no, ninguna que yo sepa', (v) => /ningun/i.test(v.allergies)],
-  ['reason', 'es una revisión de rutina después de mi consulta', (v) => /revisión de rutina/i.test(v.reason)],
-  ['mrnOrPhone', 'mi expediente es P cuatro cinco seis siete ocho nueve', (v) => Boolean(v.mrn)],
   ['surgeryDate', 'me operaron el veinte de julio de este año',
     (v) => v.date === `${new Date().getFullYear()}-07-20`],
-  ['symptoms', 'no tengo fiebre, la herida está bien, el dolor es como un tres', (v) => v.fever === false && v.pain_level === 3],
-  ['authorization', 'sí, el número de autorización es A U T H cuatro dos', (v) => v.has_authorization === true],
-  ['referringProvider', 'me manda el doctor Soto, su fax es cinco cinco cinco dos dos dos', (v) => /soto/i.test(v.provider_name)],
-  ['procedureType', 'es para una consulta de vesícula, posible colecistectomía', (v) => v.procedure.length > 0],
-  ['schedWindow', 'para hoy, si se puede', (v) => v.window === 'today'],
-  ['schedWindow', 'mejor la semana que viene', (v) => v.window === 'next_week'],
-  ['schedWindow', 'el cinco de agosto', (v) => v.window === 'specific' && /-08-05$/.test(v.date || '')],
+  ['hospital', 'me operaron en el Auxilio Mutuo', (v) => /auxilio/i.test(v.hospital)],
+  ['hospital', 'en el Hospital Menonita de Caguas', (v) => /menonita/i.test(v.hospital)],
+  ['preferredDate', 'el cinco de agosto', (v) => /-08-05$/.test(v.date || '')],
   ['preferredDate', 'el cinco de agosto, por favor', (v) => /-08-05$/.test(v.date || '')],
-  ['slotChoice', 'la segunda opción está mejor', (v) => v.choice === 'second'],
-  ['yesNo', 'sí, está bien, confirmo', (v) => v.answer === 'yes'],
-  ['yesNo', 'no, esa hora no me sirve', (v) => v.answer === 'no'],
-  // barge-in fragment / Whisper near-silence hallucination: NOT an answer —
-  // a guessed "no" here discards a value the caller had confirmed correct
-  ['yesNo', 'Gracias.', (v) => v.answer === 'unknown'],
 ];
 
 async function main() {

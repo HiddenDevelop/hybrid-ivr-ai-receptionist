@@ -15,30 +15,32 @@ const { WebSocketServer } = require('ws');
 
 const { mulawToPcm16, pcm16ToWav } = require('./audioCodec');
 const { TurnDetector } = require('./turnDetector');
-const { SpeechOnsetDetector } = require('./speechOnsetDetector');
 const { buildPromptCache, FRAME_BYTES } = require('./tts/cache');
 const { warmUp } = require('./extraction/extract');
 const { openDb } = require('./db/index');
 const { CallSession } = require('./ivr/session');
+const { createCalendarClient } = require('./calendar/googleClient');
+const { startCalendarSync } = require('./calendar/sync');
 
 const PORT = Number(process.env.PORT || 3000);
 const SPEECH_URL = `http://${process.env.SPEECH_HOST || '127.0.0.1'}:${process.env.SPEECH_PORT || '8081'}`;
 
 // 20ms frames at 8kHz. Turn ends after a silence run following >=200ms of
 // speech. How long that silence run has to be depends on what the caller was
-// asked (session.turnProfile): an open answer gets 1.8s so a caller pausing
-// mid-name or mid-date isn't cut off, a one-word answer keeps the original
-// 800ms so "sí"/"no" still feels immediate. Barge-in needs 160ms of
-// sustained speech after a 500ms grace period.
+// asked (session.expectsSpeech): an open answer gets 1.8s so a caller pausing
+// mid-name or mid-date isn't cut off. Keypad states never send audio to STT
+// at all — their detector only decides "the caller is talking at a keypad
+// question" so the question can be replayed, and 800ms keeps that reaction
+// fast.
 const TURN_PROFILES = {
-  // names, DOB, phone, insurance, allergies, symptoms, spoken dates
+  // names, DOB, phone dictation, insurance, hospital, spoken dates
   open: {
     silenceRmsThreshold: 300,
     silenceFramesToEndTurn: 90, // 1.8s
     maxTurnFrames: 1250, // 25s
     minVoicedFramesToEndTurn: 10,
   },
-  // menu choices, slot choice, yes/no
+  // keypad-only states (menu, read-back confirm, window/slot/confirm)
   short: {
     silenceRmsThreshold: 300,
     silenceFramesToEndTurn: 40, // 800ms
@@ -47,20 +49,9 @@ const TURN_PROFILES = {
   },
 };
 
-// Frames dropped from the END of a turn finished with the # key: Twilio
-// delivers the keypress as an event AND as an audible tone in the media
-// stream, and the tone's leading edge lands in the frames already buffered.
-// (deafUntil only covers audio arriving after the event.)
-const TONE_TRIM_FRAMES = 6; // 120ms
-
-// Below this there is nothing worth sending to STT — # pressed before the
-// caller said anything, or a turn that was all tone.
+// Below this there is nothing worth sending to STT — a turn that was all
+// keypress tone or line noise.
 const MIN_TURN_FRAMES = 5; // 100ms
-const ONSET_DETECTOR_OPTS = {
-  rmsThreshold: 500,
-  voicedFramesToTrigger: 8,
-  graceFrames: 25,
-};
 
 async function transcribe(wavBuffer) {
   const res = await fetch(`${SPEECH_URL}/stt`, {
@@ -115,7 +106,7 @@ async function sendSms(to, text) {
 
 // Live-transfer the call: redirect its TwiML to <Dial> the target line.
 // Twilio tears down the media stream when the redirect takes effect, which
-// is why the escalation prompt is always played to the caller first.
+// is why the handoff prompt is always played to the caller first.
 async function transferCall(callSid, number) {
   await twilioPost(`Calls/${callSid}.json`, {
     Twiml: `<?xml version="1.0" encoding="UTF-8"?><Response><Dial>${number}</Dial></Response>`,
@@ -126,34 +117,21 @@ async function endCall(callSid) {
   await twilioPost(`Calls/${callSid}.json`, { Status: 'completed' });
 }
 
-// Which line an escalation goes to. Red flags page the on-call MD; every
-// other reason (couldn't understand, no slots, caller pressed 0) is a
-// scheduling-team matter and must NOT page the surgeon — without a
-// scheduling number it stays log-only, exactly the pre-transfer behavior.
-function escalationTarget(reason) {
-  // red_flag: keyword gate hit. symptom_report: structured extraction
-  // reported fever/bleeding/drain/severe pain. Both are clinical.
-  if (reason === 'red_flag' || reason === 'symptom_report') {
-    return process.env.ESCALATION_NUMBER || null;
-  }
-  return process.env.SCHEDULING_NUMBER || null;
-}
 
 // One per WebSocket connection = one call.
 class CallHandler {
-  constructor(ws, { db, promptCache }) {
+  constructor(ws, { db, promptCache, calendarSync }) {
     this.ws = ws;
     this.db = db;
     this.promptCache = promptCache;
+    this.calendarSync = calendarSync ?? null; // null = sync disabled (no token yet)
     this.streamSid = null;
     this.session = null;
     this.mode = 'idle'; // idle | playing | listening
     // Replaced per turn by beginListening() with a profile-sized detector;
     // this initial one just makes the instance valid before the first listen.
     this.turnDetector = new TurnDetector(TURN_PROFILES.short);
-    this.onsetDetector = new SpeechOnsetDetector(ONSET_DETECTOR_OPTS);
-    this.playbackToken = 0; // bumped to cancel in-flight playback (barge-in)
-    this.pendingListen = false;
+    this.playbackToken = 0; // bumped to cancel in-flight playback (DTMF interrupt / supersession)
     this.turnStartedAt = null;
     // Action batches run strictly one at a time through this chain, and a
     // batch is abandoned when newer caller input arrives (generation bump).
@@ -164,17 +142,9 @@ class CallHandler {
     this.actionGeneration = 0;
     // Twilio delivers the keypress as a dtmf event AND as an audible tone
     // inside the media stream; ignore inbound audio briefly around a
-    // keypress so the tone can't fake a barge-in or a caller turn.
+    // keypress so the tone can't fake a caller turn.
     this.deafUntil = 0;
-    // Ring of caller frames captured DURING prompt playback. On barge-in
-    // the whole last second is seeded into the turn, not just the frames
-    // that triggered onset detection — otherwise leading words get clipped
-    // ("[es que no] puedo respirar"), which can flip the meaning of a
-    // transcript the red-flag gate depends on.
-    this.preSpeechRing = [];
   }
-
-  static PRE_SPEECH_RING_FRAMES = 50; // 1s at 20ms/frame
 
   async handleMessage(raw) {
     const msg = JSON.parse(raw);
@@ -196,20 +166,6 @@ class CallHandler {
       case 'dtmf': {
         const digit = String(msg.dtmf.digit);
         console.log(`[call ${this.streamSid}] dtmf ${digit}`);
-        // "#" means "I'm done talking" — the caller ending their own turn
-        // instead of waiting out the silence timer. It must NOT fall into the
-        // handling below, which resets the turn detector and would throw away
-        // the very audio we're being told is complete.
-        if (digit === '#') {
-          this.deafUntil = Date.now() + 400; // swallow the in-band tone
-          // Pressed while a prompt is playing, or while we're already
-          // transcribing, it means nothing — ignore it rather than let it
-          // reach onDtmf, where an unmapped digit costs the caller a strike.
-          if (this.mode === 'listening') {
-            await this.finalizeTurn({ trimTrailingFrames: TONE_TRIM_FRAMES });
-          }
-          break;
-        }
         this.deafUntil = Date.now() + 400; // swallow the in-band tone
         this.turnDetector.reset(); // drop any tone audio already captured
         this.stopPlayback();
@@ -227,29 +183,8 @@ class CallHandler {
   async onFrame(frame) {
     if (Date.now() < this.deafUntil) return; // DTMF tone window
 
-    if (this.mode === 'playing') {
-      // Read-back states suppress voice barge-in (session.bargeInAllowed):
-      // cancelling the read-back on a backchannel or STT hallucination
-      // discards the very sentence the caller must hear in full. DTMF
-      // still interrupts — the dtmf handler stops playback in any mode.
-      if (!(this.session?.bargeInAllowed ?? true)) return;
-      this.preSpeechRing.push(frame);
-      if (this.preSpeechRing.length > CallHandler.PRE_SPEECH_RING_FRAMES) this.preSpeechRing.shift();
-      // Barge-in: caller talking over the prompt cancels playback; the
-      // buffered second of audio (which contains the triggering frames)
-      // seeds the new turn so nothing the caller said is lost.
-      if (this.onsetDetector.addFrame(frame)) {
-        console.log(`[call ${this.streamSid}] barge-in`);
-        this.stopPlayback();
-        this.beginListening();
-        this.onsetDetector.takeFrames(); // consumed via the ring below
-        for (const seeded of this.preSpeechRing) {
-          this.turnDetector.addFrame(seeded);
-        }
-        this.preSpeechRing = [];
-      }
-      return;
-    }
+    // Audio during playback is ignored — prompts always play to completion.
+    // DTMF still interrupts: the dtmf handler stops playback in any mode.
     if (this.mode !== 'listening') return;
 
     if (this.turnDetector.addFrame(frame)) {
@@ -258,23 +193,30 @@ class CallHandler {
   }
 
   // Treat the buffered audio as one complete caller turn: transcribe it, run
-  // it through the session, queue whatever comes back. Reached either by the
-  // silence timer (onFrame above) or by the caller pressing # to say they're
-  // done, which trims the keypress tone off the tail first.
-  async finalizeTurn({ trimTrailingFrames = 0 } = {}) {
+  // it through the session, queue whatever comes back. Reached when the
+  // silence timer decides the caller is finished (onFrame above).
+  async finalizeTurn() {
     this.mode = 'idle';
     this.turnStartedAt = Date.now();
     const generation = ++this.actionGeneration;
 
-    let mulaw = this.turnDetector.concatFrames();
-    if (trimTrailingFrames > 0) {
-      mulaw = mulaw.subarray(0, Math.max(0, mulaw.length - trimTrailingFrames * FRAME_BYTES));
-    }
-    // # pressed before saying anything (or a turn that was all tone): no
-    // point paying for STT, and no strike — just go back to listening.
+    const mulaw = this.turnDetector.concatFrames();
+    // A turn that was all tone or noise: no point paying for STT — just go
+    // back to listening.
     if (mulaw.length < MIN_TURN_FRAMES * FRAME_BYTES) {
       console.log(`[call ${this.streamSid}] turn too short (${mulaw.length} bytes) — ignoring`);
       this.beginListening();
+      return;
+    }
+
+    // Keypad-only question: caller speech never reaches /stt or the LLM.
+    // The session replays the question (with its key instructions) instead.
+    // No STT also means no noise filter here — any sustained voiced turn
+    // (TV, speakerphone) replays the question; acceptable for the prototype
+    // since the replay includes the 0-for-a-person reminder.
+    if (!this.session.expectsSpeech) {
+      console.log(`[call ${this.streamSid}] speech at keypad state — replaying question (no STT)`);
+      this.queueActions(this.session.onUnexpectedSpeech(), generation);
       return;
     }
 
@@ -319,8 +261,9 @@ class CallHandler {
   // turnDetector.js — that file carries over from the previous project and
   // its interface is shared (CLAUDE.md).
   beginListening() {
-    const profile = this.session?.turnProfile ?? 'open';
-    this.turnDetector = new TurnDetector(TURN_PROFILES[profile]);
+    this.turnDetector = new TurnDetector(
+      TURN_PROFILES[(this.session?.expectsSpeech ?? true) ? 'open' : 'short'],
+    );
     this.mode = 'listening';
   }
 
@@ -335,8 +278,8 @@ class CallHandler {
   // How far ahead of real time to keep Twilio's playout buffer while
   // streaming a prompt. Enough cushion that a timer overshoot, GC pause, or
   // Piper synthesis burst can't starve playback (heard as stuttery, laggy
-  // audio); small enough that barge-in stays snappy — stopPlayback()'s
-  // "clear" event flushes whatever is buffered ahead anyway.
+  // audio); small enough that a DTMF interrupt stays snappy —
+  // stopPlayback()'s "clear" event flushes whatever is buffered ahead anyway.
   static PLAYBACK_LEAD_MS = 200;
 
   // Stream cached mulaw frames to Twilio against an absolute schedule:
@@ -347,8 +290,6 @@ class CallHandler {
   // playback heard on real calls.
   async playFrames(frames) {
     const token = ++this.playbackToken;
-    this.onsetDetector.reset();
-    this.preSpeechRing = [];
     this.mode = 'playing';
     const start = Date.now();
     for (let i = 0; i < frames.length; i += 1) {
@@ -391,10 +332,12 @@ class CallHandler {
         case 'sms':
           await sendSms(action.to, action.text);
           break;
-        case 'escalate': {
-          console.error(`[call ${this.streamSid}] ESCALATE (${action.reason})`
-            + (action.matched ? ` matched="${action.matched}"` : ''));
-          const target = escalationTarget(action.reason);
+        case 'transfer': {
+          // The only transfer left is the caller pressing 0 for a person
+          // (reason 'caller_request') — without a scheduling number it
+          // stays log-only.
+          console.log(`[call ${this.streamSid}] TRANSFER (${action.reason})`);
+          const target = process.env.SCHEDULING_NUMBER || null;
           if (target && this.callSid && twilioCreds()) {
             try {
               await transferCall(this.callSid, target);
@@ -407,6 +350,13 @@ class CallHandler {
           }
           break;
         }
+        case 'calendarSync':
+          // Fire-and-forget: the booking is already committed, and a Google
+          // outage must never delay the goodbye/hangup. Failures are retried
+          // by the background reconciler.
+          this.calendarSync?.syncNow()
+            .catch((err) => console.error(`[calendar] sync after booking failed: ${err.message}`));
+          break;
         case 'hangup':
           if (this.callSid && twilioCreds()) {
             // half a second of grace so Twilio finishes playing the goodbye
@@ -480,6 +430,29 @@ async function main() {
   console.log(`sidecar ready (voice: ${health.tts}, length_scale ${health.tts_length_scale} — 1.0 = native pace)`);
 
   const db = openDb();
+
+  // Google Calendar mirror (recorded exception — see CLAUDE.md). Optional:
+  // without the one-time consent token the server runs normally, just
+  // without calendar events.
+  let calendarSync = null;
+  const calendarClient = createCalendarClient({
+    credentialsFile: process.env.GOOGLE_CREDENTIALS_FILE || 'credentials.json',
+    tokenFile: process.env.GOOGLE_TOKEN_FILE || 'var/google-token.json',
+  });
+  if (calendarClient) {
+    calendarSync = startCalendarSync({
+      db,
+      client: calendarClient,
+      calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary',
+      timeZone: process.env.GOOGLE_CALENDAR_TIMEZONE || 'America/Puerto_Rico',
+      intervalMs: Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 60000),
+    });
+    console.log('[calendar] sync enabled — draining any unsynced bookings');
+    calendarSync.syncNow().catch((err) => console.error(`[calendar] startup sync failed: ${err.message}`));
+  } else {
+    console.warn('[calendar] sync disabled — no OAuth token yet; run: node --env-file-if-exists=.env scripts/google-auth.js');
+  }
+
   const promptCache = await buildPromptCache();
   await warmUp();
 
@@ -507,7 +480,7 @@ async function main() {
   const wss = new WebSocketServer({ server, path: '/media' });
 
   wss.on('connection', (ws) => {
-    const handler = new CallHandler(ws, { db, promptCache });
+    const handler = new CallHandler(ws, { db, promptCache, calendarSync });
     ws.on('message', (raw) => {
       handler.handleMessage(raw).catch((err) => console.error(`call handler error: ${err}`));
     });
