@@ -13,10 +13,8 @@ function generateMrn(db) {
 function createPatient(db, fields) {
   const mrn = fields.mrn || generateMrn(db);
   db.prepare(`
-    INSERT INTO patients (mrn, first_name, last_name, dob, phone,
-      insurance_provider, policy_number, group_number, allergies)
-    VALUES (@mrn, @firstName, @lastName, @dob, @phone,
-      @insuranceProvider, @policyNumber, @groupNumber, @allergies)
+    INSERT INTO patients (mrn, first_name, last_name, dob, phone, insurance_provider)
+    VALUES (@mrn, @firstName, @lastName, @dob, @phone, @insuranceProvider)
   `).run({
     mrn,
     firstName: fields.firstName ?? null,
@@ -24,9 +22,6 @@ function createPatient(db, fields) {
     dob: fields.dob ?? null,
     phone: fields.phone ?? null,
     insuranceProvider: fields.insuranceProvider ?? null,
-    policyNumber: fields.policyNumber ?? null,
-    groupNumber: fields.groupNumber ?? null,
-    allergies: fields.allergies ?? null,
   });
   return mrn;
 }
@@ -44,18 +39,4 @@ function findByPhone(db, phone) {
   return rows.find((r) => String(r.phone).replace(/\D/g, '').slice(-10) === digits) ?? null;
 }
 
-function createReferral(db, fields) {
-  const info = db.prepare(`
-    INSERT INTO referrals (mrn, referring_provider, referring_fax, authorization_code, procedure_type)
-    VALUES (@mrn, @referringProvider, @referringFax, @authorizationCode, @procedureType)
-  `).run({
-    mrn: fields.mrn ?? null,
-    referringProvider: fields.referringProvider ?? null,
-    referringFax: fields.referringFax ?? null,
-    authorizationCode: fields.authorizationCode ?? null,
-    procedureType: fields.procedureType ?? null,
-  });
-  return info.lastInsertRowid;
-}
-
-module.exports = { createPatient, findByMrn, findByPhone, createReferral, generateMrn };
+module.exports = { createPatient, findByMrn, findByPhone };

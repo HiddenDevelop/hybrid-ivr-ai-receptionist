@@ -1,30 +1,26 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 
-// PROMPTS is built once at module load from process.env, so each case sets
-// the flag and re-requires a fresh copy of the module.
-function loadPrompts(env) {
-  const prev = process.env.FIELD_CONFIRM_DTMF;
-  if (env === undefined) delete process.env.FIELD_CONFIRM_DTMF;
-  else process.env.FIELD_CONFIRM_DTMF = env;
-  delete require.cache[require.resolve('./prompts')];
+// Confirmations are keypad-only by design (no FIELD_CONFIRM flags anymore):
+// the read-back question and every offer/confirmation sentence must announce
+// keys and must NOT invite a spoken answer.
+test('confirm_field announces the 1/2 keys and never mentions speaking', () => {
   const { PROMPTS } = require('./prompts');
-  if (prev === undefined) delete process.env.FIELD_CONFIRM_DTMF;
-  else process.env.FIELD_CONFIRM_DTMF = prev;
-  delete require.cache[require.resolve('./prompts')];
-  return PROMPTS;
-}
-
-test('confirm_field defaults to voice-only sí/no', () => {
-  const PROMPTS = loadPrompts(undefined);
-  assert.match(PROMPTS.confirm_field, /Diga sí o no/);
-  assert.doesNotMatch(PROMPTS.confirm_field, /[Oo]prima/);
+  assert.match(PROMPTS.confirm_field, /Oprima uno/);
+  assert.doesNotMatch(PROMPTS.confirm_field, /[Dd]iga|decir/);
 });
 
-test('FIELD_CONFIRM_DTMF=true reverts to announcing the 1/2 keys', () => {
-  const PROMPTS = loadPrompts('true');
-  assert.match(PROMPTS.confirm_field, /Oprima uno/);
-  assert.match(PROMPTS.confirm_field, /decir sí o no/);
+test('offer and confirmation sentences are keypad-only too', () => {
+  const { slotOfferText, nearestSlotOfferText, confirmSlotText, PROMPTS } = require('./prompts');
+  const one = [{ date: '2026-07-27', time: '09:00' }];
+  const two = [...one, { date: '2026-07-28', time: '11:00' }];
+  for (const text of [
+    slotOfferText(one), slotOfferText(two), nearestSlotOfferText(one[0]), confirmSlotText(one[0]),
+    PROMPTS.ask_phone_caller_id,
+  ]) {
+    assert.match(text, /[Oo]prima/);
+    assert.doesNotMatch(text, /[Dd]iga|decir/);
+  }
 });
 
 // smsConfirmationText reads CLINIC_NAME/CLINIC_ADDRESS at call time, so no

@@ -1,5 +1,5 @@
 // ALL caller-facing copy lives here, and all of it is Spanish — greetings,
-// re-prompts, confirmations, fallbacks, escalation, SMS. No English
+// re-prompts, confirmations, fallbacks, handoffs, SMS. No English
 // fallback exists anywhere in the call (CLAUDE.md "Language requirement").
 // Adding a prompt in English here is a bug, not a stub.
 //
@@ -9,23 +9,10 @@
 // synthesized live, once per call at most; espeak-ng reads the digits in
 // Spanish, and times are spelled out in words to keep pronunciation clean.
 
-// Speech-controlled main menu is currently DISABLED (the menu is DTMF-only;
-// data-collection answers are still spoken). To re-enable, set
-// MENU_SPEECH_ENABLED=true in .env and restart — the greeting copy below
-// and the session routing both key off this one flag.
-const MENU_SPEECH_ENABLED = process.env.MENU_SPEECH_ENABLED === 'true';
-
-// Field read-back confirmation style. Default is voice-only ("diga sí o
-// no"); set FIELD_CONFIRM_DTMF=true in .env to go back to announcing the
-// 1/2 key options. Keys 1 and 2 keep working in BOTH modes (session.onDtmf
-// doesn't key off this) — the flag only changes what the caller is told.
-// Like every fixed prompt this is cached at startup: restart after changing.
-const FIELD_CONFIRM_DTMF = process.env.FIELD_CONFIRM_DTMF === 'true';
-
 // Copy is written for Puerto Rico specifically: "oprima" (not "marque"),
 // "cita" (not "consulta"), "récord médico" (not "expediente"), "referido"
-// (not "referencia"), "plan médico" (not "aseguranza"), "médico de turno"
-// (not "de guardia"). Keep it that way in future edits.
+// (not "referencia"), "plan médico" (not "aseguranza"). Keep it that way
+// in future edits.
 const PROMPTS = {
   greeting_menu:
     'Gracias por llamar a la Clínica de Cirugía General. '
@@ -33,35 +20,26 @@ const PROMPTS = {
     + 'Si es paciente nuevo, oprima uno. '
     + 'Para una cita de seguimiento, oprima dos. '
     + 'Si le operaron recientemente, oprima tres. '
-    + 'Si llama por un referido médico, oprima cuatro. '
-    + (MENU_SPEECH_ENABLED
-      ? 'También puede decir: paciente nuevo, seguimiento, operación reciente, o referido. '
-      : '')
     // The escape hatch, announced up front and repeated in every re-prompt:
     // most of this clinic's callers are elderly, and a caller who can't get
     // through the automated flow must never have to guess how to reach a
     // person. 0 works from ANY point in the call (see session.onDtmf).
     + 'Si prefiere hablar con una persona, oprima cero en cualquier momento. '
     + 'También puede oprimir estrella para volver a este menú. ',
-    // Optional, never required: the turn detector waits 1.8s on open answers
-    // by itself. This is for callers who would rather not wait.
-    //+ 'Cuando termine de hablar, puede esperar un momento o oprimir el numeral.',
   menu_retry:
     'Perdón. Oprima uno para paciente nuevo, dos para seguimiento, '
-    + 'tres si le operaron recientemente, o cuatro para un referido médico. '
+    + 'o tres si le operaron recientemente. '
     // The 0 escape hatch is repeated in every re-prompt (CLAUDE.md): the
     // caller who just fumbled a question is exactly the caller most likely
     // to need a person.
     + 'Si prefiere hablar con una persona, oprima cero. ',
 
-  // shared data-collection re-prompts / bailout
+  // shared data-collection re-prompt. There is no automatic bailout: a
+  // question that keeps failing is re-asked indefinitely, and this prompt's
+  // 0 reminder is the caller's stated way out.
   reprompt_generic:
     'Perdón, no le entendí bien. ¿Podría repetirlo, por favor? '
-    + 'Si prefiere, cuando termine de hablar, oprima el numeral. '
-    + 'Y si desea hablar con una persona, oprima cero. ',
-  handoff_human:
-    'Estoy teniendo dificultades para entenderle. '
-    + 'Le voy a comunicar con nuestro equipo de citas para ayudarle. Un momento, por favor.',
+    + 'Si desea hablar con una persona, oprima cero. ',
   // Caller pressed 0. Deliberately warm and short — they have already
   // decided; nothing here should sound like another attempt to keep them
   // in the automated flow.
@@ -69,23 +47,22 @@ const PROMPTS = {
     'Con mucho gusto. Le comunico con nuestro equipo de citas. Un momento, por favor.',
 
   // Field read-back (see fieldReadbackText below). The value itself is one
-  // short live-synthesized sentence; this fixed question is cached.
-  confirm_field: FIELD_CONFIRM_DTMF
-    ? '¿Es correcto? Oprima uno si está bien, o dos si lo tengo que corregir. '
-      + 'También puede decir sí o no.'
-    : '¿Es correcto? Diga sí o no, por favor.',
+  // short live-synthesized sentence; this fixed question is cached. Keypad
+  // only — confirmations are never answered by voice.
+  confirm_field: '¿Es correcto? Oprima uno si está bien, o dos si lo tengo que corregir.',
   retry_field: 'Está bien, vamos a corregirlo.',
 
   // new patient
   ask_full_name: 'Para empezar, ¿me puede decir su nombre y apellido, por favor?',
   ask_dob: 'Gracias. ¿Cuál es su fecha de nacimiento?',
   ask_phone: '¿A qué número de teléfono le podemos llamar?',
-  // Variant played when Twilio delivered a caller ID: the caller can accept
-  // the number they're calling from with a "sí" instead of dictating ten
-  // digits. The digits still get the normal read-back before being kept.
+  // Variant played when Twilio delivered a caller ID: a keypad question —
+  // 1 accepts the number the caller is calling from, 2 moves on to
+  // dictating one (flows/phoneSteps.js). The accepted digits still get the
+  // normal read-back before being kept.
   ask_phone_caller_id:
-    '¿Le podemos llamar al número desde el cual nos está llamando? '
-    + 'Diga sí, o dígame el número que prefiera.',
+    'Si le podemos llamar al número desde el cual nos está llamando, oprima uno. '
+    + 'Si prefiere darnos otro número, oprima dos.',
   // Insurance is asked in two turns: coverage TYPE first (comercial vs.
   // Reforma / Plan Vital — Vital patients must be reminded to bring a
   // referido from their médico primario), then the company. If the caller
@@ -102,31 +79,12 @@ const PROMPTS = {
   // commercial callers must never hear it.
   vital_referral_reminder:
     'Perfecto. Le recordamos que para su cita debe traer un referido vigente de su médico primario.',
-  ask_allergies: '¿Es alérgico o alérgica a algún medicamento?',
-  ask_reason: '¿Cuál es el motivo de su cita?',
 
-  // follow-up
-  ask_mrn_or_phone:
-    'Para buscar su récord, dígame su número de récord médico, '
-    + 'o el número de teléfono que tenemos registrado.',
-  record_not_found:
-    'No encontré su récord con esos datos. Vamos a intentarlo una vez más.',
-  ask_followup_reason: '¿Cuál es el motivo de su cita de seguimiento?',
-
-  // post-op
+  // post-op — administrative rebooking only: date, hospital, name, phone
+  // (no symptom check on this path; see flows/postOp.js)
   ask_surgery_date: '¿En qué fecha fue su operación?',
-  ask_symptoms:
-    'Dígame cómo se siente. ¿Tiene fiebre, sangrado, o algún problema con la herida o el drenaje? '
-    + 'Y del cero al diez, ¿cuánto dolor tiene?',
-  escalate_red_flag:
-    'Por lo que me dice, es importante que hable ahora mismo con el médico de turno. '
-    + 'Le voy a comunicar de inmediato. Por favor, no cuelgue.',
-
-  // referral
-  ask_authorization:
-    '¿Ya tiene la autorización de su plan médico? Si tiene el número de autorización, dígamelo, por favor.',
-  ask_referring_provider: '¿Cómo se llama el doctor que le refiere?',
-  ask_procedure: '¿Para qué procedimiento o tipo de cita le refieren?',
+  ask_hospital: '¿En qué hospital fue su operación?',
+  ask_postop_full_name: 'Gracias. ¿Me puede decir su nombre y apellido, por favor?',
 
   // scheduling — broad window first, then specific options
   ask_sched_window:
@@ -134,20 +92,29 @@ const PROMPTS = {
     + 'tres para la próxima semana, o cuatro para sugerir una fecha.',
   ask_preferred_date:
     '¿Qué fecha le conviene? Puede decir, por ejemplo: el martes que viene, o el cinco de agosto.',
+  // Two grammatical variants of "nothing available": a single day (hoy, or
+  // a specific date the caller suggested) vs. a multi-day window (esta
+  // semana / la próxima semana). Playing the plural one for one day is the
+  // kind of small wrongness this caller base notices.
+  slots_none_day: 'No tengo citas disponibles para ese día.',
   slots_none_window: 'No tengo citas disponibles para esas fechas.',
-  // Played when the caller runs out of scheduling rounds — empty windows or
-  // offers that didn't suit them. NOT the "couldn't understand you" handoff:
-  // this caller answered fine every time, and the goodbye must not sound
-  // like it was their fault.
+  // Nothing bookable in the caller's window NOR for weeks after it — say
+  // so and return to the window menu (no automatic transfer; 0 is the way
+  // to a person and gets mentioned here).
   slots_none:
-    'Lo siento, no encontré una cita que le convenga. '
-    + 'Le voy a comunicar con nuestro equipo de citas para ayudarle. Un momento, por favor.',
+    'Lo siento, no encontré citas disponibles próximamente. Vamos a buscar otra fecha. '
+    + 'Si prefiere hablar con una persona, oprima cero. ',
+  // Played before re-asking the window question after the caller declined
+  // an offer: declining can loop forever by design, so every loop reminds
+  // them a person is one key away.
+  sched_retry_hint:
+    'Está bien, busquemos otra fecha. '
+    + 'Recuerde que puede oprimir cero para hablar con una persona. ',
   // A suggested date that already went by — understood, just unusable.
   date_in_past: 'Esa fecha ya pasó.',
   booking_confirmed_sms:
     'Su cita quedó confirmada. Le enviaremos un mensaje de texto con los detalles. '
     + 'Gracias por llamar. Que tenga buen día.',
-  goodbye: 'Gracias por llamar a la Clínica de Cirugía General. Que tenga buen día.',
 };
 
 const DAY_NAMES = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
@@ -187,17 +154,6 @@ function spanishDigits(value) {
   return groups.join(', ');
 }
 
-// Same idea for alphanumeric codes (MRN, authorization number): spell them
-// out character by character — "P000123" as a word is unintelligible.
-function spanishCharacters(value) {
-  return String(value ?? '').toUpperCase().replace(/\s+/g, '').split('').join(' ');
-}
-
-// Caller said they have no allergies; the extraction normalizes this to
-// "ninguna" but callers phrase it several ways and the model passes some
-// of them through verbatim.
-const NO_ALLERGIES = /^(ningun[ao]s?|no|nada|ninguno|no tengo|sin alergias)\b/i;
-
 // One read-back sentence per collected field, in Spanish, spoken back to
 // the caller before the answer is kept (session.js "verify" state). This is
 // what turns a silent mis-transcription into something the caller can catch
@@ -215,25 +171,8 @@ const FIELD_READBACKS = {
     ? `Entendí que su plan médico es ${v.provider}, ${v.insurance_type === 'vital' ? 'del Plan Vital' : 'un plan comercial'}.`
     : `Entendí que su plan médico es ${v.insurance_type === 'vital' ? 'del Plan Vital' : 'comercial'}.`),
   insurance: (v) => `Entendí que su plan médico es ${v.provider}.`,
-  allergies: (v) => (NO_ALLERGIES.test(String(v.allergies).trim())
-    ? 'Entendí que no tiene alergia a ningún medicamento.'
-    : `Entendí que tiene alergia a ${v.allergies}.`),
-  reason: (v) => `Entendí que el motivo de su cita es ${v.reason}.`,
-  mrnOrPhone: (v) => (v.mrn
-    ? `Entendí que su número de récord es ${spanishCharacters(v.mrn)}.`
-    : `Entendí que su teléfono es ${spanishDigits(v.phone)}.`),
   surgeryDate: (v) => `Entendí que su operación fue el ${spanishDateLong(v.date)}.`,
-  // Only ever reached on the benign branch — fever/bleeding/drain trouble
-  // and pain >= 8 escalate before the read-back (flows/postOp.js accept()).
-  symptoms: (v) => `Entendí que ${v.fever ? 'tiene fiebre' : 'no tiene fiebre'}, `
-    + `${v.bleeding ? 'tiene sangrado' : 'no tiene sangrado'}, `
-    + `${v.drain_concern ? 'tiene problemas con la herida o el drenaje' : 'no tiene problemas con la herida ni el drenaje'}, `
-    + `y que su dolor es de ${v.pain_level} de diez.`,
-  authorization: (v) => (v.has_authorization
-    ? `Entendí que sí tiene la autorización de su plan médico${v.authorization_code ? `, número ${spanishCharacters(v.authorization_code)}` : ''}.`
-    : 'Entendí que todavía no tiene la autorización de su plan médico.'),
-  referringProvider: (v) => `Entendí que le refiere ${v.provider_name}.`,
-  procedureType: (v) => `Entendí que le refieren para ${v.procedure}.`,
+  hospital: (v) => `Entendí que su operación fue en ${v.hospital}.`,
 };
 
 // Returns null when a field has no read-back (or its value can't be
@@ -271,12 +210,11 @@ function spanishSlot(slot) {
 
 // Dynamic sentences (synthesized live, once per call). Every offer tells
 // the caller how to DECLINE, not just how to accept — without a stated way
-// out, a caller none of whose offers fit can only fumble until the strike
-// counter hands them off "for not being understood".
+// out, a caller none of whose offers fit can only fumble at the keypad.
 function slotOfferText(slots) {
   if (slots.length === 1) {
     return `Tengo una cita disponible ${spanishSlot(slots[0])}. `
-      + 'Si le sirve, oprima uno o diga sí. Si no le conviene, oprima dos o diga no.';
+      + 'Si le sirve, oprima uno. Si no le conviene, oprima dos.';
   }
   return `Tengo dos opciones: la primera, ${spanishSlot(slots[0])}. `
     + `La segunda, ${spanishSlot(slots[1])}. `
@@ -284,9 +222,19 @@ function slotOfferText(slots) {
     + 'Si ninguna le conviene, oprima tres.';
 }
 
+// Played right after slots_none_day / slots_none_window when the caller's
+// requested window is full: proposes the nearest slot after that window
+// instead of bouncing them back to the window menu empty-handed. Same
+// accept/decline keys as the one-slot offer above — the session runs this
+// through the same 'offer' state.
+function nearestSlotOfferText(slot) {
+  return `La próxima cita disponible es ${spanishSlot(slot)}. `
+    + 'Si le sirve, oprima uno. Si no le conviene, oprima dos.';
+}
+
 function confirmSlotText(slot) {
   return `Muy bien. Su cita quedaría ${spanishSlot(slot)}. `
-    + '¿Se la confirmo? Oprima uno para sí, o dos para no. También puede decir sí o no.';
+    + '¿Se la confirmo? Oprima uno para sí, o dos para no.';
 }
 
 // Closing when there is no number to text (blocked caller ID and no phone
@@ -327,16 +275,11 @@ function smsConfirmationText(slot) {
 }
 
 module.exports = {
-  MENU_SPEECH_ENABLED,
-  FIELD_CONFIRM_DTMF,
   PROMPTS,
   spanishDate,
-  spanishDateLong,
-  spanishDigits,
-  spanishCharacters,
   spanishTime,
-  spanishSlot,
   slotOfferText,
+  nearestSlotOfferText,
   confirmSlotText,
   bookingConfirmedNoSmsText,
   smsConfirmationText,

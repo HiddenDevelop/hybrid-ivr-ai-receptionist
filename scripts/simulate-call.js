@@ -1,12 +1,13 @@
 // Simulated end-to-end call — everything real except Twilio: the "caller"
 // is Piper-generated Spanish speech streamed as 8kHz mulaw frames into the
-// Media Streams WebSocket, so STT, extraction (Ollama), flows, red-flag
-// gate, scheduling, and SQLite all run exactly as they would on a phone
-// call. Run with the sidecar up and the server started (or let this start
-// the server via `node scripts/simulate-call.js`).
+// Media Streams WebSocket, so STT, extraction (Ollama), flows, scheduling,
+// and SQLite all run exactly as they would on a phone call. Run with the
+// sidecar up and the server started (or let this start the server via
+// `node scripts/simulate-call.js`).
 //
-// Scenario: post-op caller, benign first answer, then a red-flag phrase —
-// asserts the call escalates without booking.
+// Scenario: new-patient caller answers the name question, confirms the
+// read-back, then presses 0 to reach a person — asserts the call hands off
+// without booking anything or writing a patient row.
 
 // The simulator wipes its database on every run, so it gets its OWN file —
 // and takes it by force, because the usual way to run this is with .env
@@ -81,17 +82,17 @@ async function main() {
   const send = (obj) => ws.send(JSON.stringify(obj));
   send({ event: 'start', start: { streamSid: 'SIM1', customParameters: { from: '5550001111' } } });
 
-  // let the greeting play a moment, then choose post-op via DTMF
+  // let the greeting play a moment, then choose new patient via DTMF
   await sleep(3000);
   console.log(`[sim] greeting frames received so far: ${receivedMediaFrames}`);
   if (receivedMediaFrames === 0) throw new Error('no greeting audio received');
-  send({ event: 'dtmf', dtmf: { digit: '3' } });
-  await sleep(4000); // ask_surgery_date prompt plays
+  send({ event: 'dtmf', dtmf: { digit: '1' } });
+  await sleep(4000); // ask_full_name prompt plays
 
-  // finishKey=true ends the turn the way a caller who doesn't want to wait
-  // does: a short pause, then #. Otherwise the turn ends on silence alone.
-  async function speakAsCaller(text, { finishKey = false } = {}) {
-    console.log(`[sim] caller says: "${text}"${finishKey ? ' (then presses #)' : ''}`);
+  // Turns end on silence alone: the tail of silence frames has to clear the
+  // turn detector's silence window.
+  async function speakAsCaller(text) {
+    console.log(`[sim] caller says: "${text}"`);
     const frames = await callerAudioFrames(text);
     for (const frame of frames) {
       send({ event: 'media', media: { payload: frame.toString('base64') } });
@@ -101,43 +102,42 @@ async function main() {
     // (silenceFramesToEndTurn=90, i.e. 1.8s), so the silence tail has to
     // clear that or the turn hangs until the 25s cap. Keep this above the
     // largest silenceFramesToEndTurn in index.js TURN_PROFILES.
-    const tailFrames = finishKey ? 10 : 100;
-    for (let i = 0; i < tailFrames; i += 1) {
+    for (let i = 0; i < 100; i += 1) {
       send({ event: 'media', media: { payload: silenceFrame.toString('base64') } });
       await sleep(5);
     }
-    if (finishKey) send({ event: 'dtmf', dtmf: { digit: '#' } });
   }
 
   const turnStart = Date.now();
-  await speakAsCaller('Me operaron el veinte de julio de este año.');
-  await sleep(8000); // STT + extraction + the read-back of the date
+  await speakAsCaller('Me llamo María García.');
+  await sleep(8000); // STT + extraction + the read-back of the name
   console.log(`[sim] first turn round-trip window: ${Date.now() - turnStart}ms (includes prompt playback)`);
 
-  // Every collected field is now read back ("Entendí que su operación fue
-  // el 20 de julio de 2026. ¿Es correcto?") and kept only once the caller
-  // confirms. 1 = sí; the symptom question follows.
+  // Every collected field is read back ("Entendí que su nombre es María
+  // García. ¿Es correcto?") and kept only once the caller confirms.
+  // 1 = sí; the date-of-birth question follows.
   console.log('[sim] caller confirms the read-back (presses 1)');
   send({ event: 'dtmf', dtmf: { digit: '1' } });
-  await sleep(9000); // ask_symptoms prompt
+  await sleep(9000); // ask_dob prompt
 
-  // Finished with # rather than silence: exercises the finish-key path AND
-  // confirms the red-flag gate still fires on a turn finalized that way.
-  await speakAsCaller('Es que no puedo respirar y estoy sangrando mucho.', { finishKey: true });
-  await sleep(6000);
+  // Mid-collection the caller asks for a person: 0 must hand off from any
+  // state, and nothing collected so far may be written.
+  console.log('[sim] caller presses 0 to reach a person');
+  send({ event: 'dtmf', dtmf: { digit: '0' } });
+  await sleep(6000); // handoff_operator prompt + transfer
 
-  // Verify: no appointment booked (red flag skips scheduling)
   const { openDb } = require('../src/server/db/index');
   const db = openDb(process.env.DB_PATH);
-  const count = db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n;
-  console.log(`[sim] appointments booked: ${count} (expected 0 — red flag escalated)`);
+  const appts = db.prepare('SELECT COUNT(*) AS n FROM appointments').get().n;
+  const pats = db.prepare('SELECT COUNT(*) AS n FROM patients').get().n;
+  console.log(`[sim] appointments: ${appts}, patients: ${pats} (expected 0/0 — caller bailed to a human)`);
 
   ws.close();
-  if (count !== 0) {
-    console.error('[sim] FAIL: appointment was booked after a red-flag phrase');
+  if (appts !== 0 || pats !== 0) {
+    console.error('[sim] FAIL: data was written for a call that bailed out with 0');
     process.exit(1);
   }
-  console.log('[sim] PASS: red-flag call escalated, nothing was scheduled');
+  console.log('[sim] PASS: 0 handed off to a human, nothing was stored');
   process.exit(0);
 }
 

@@ -30,7 +30,8 @@ function toLocalIso(date) {
 // fallback when one day is all the range has.
 function findOpenSlotsBetween(db, { from, to, now, count = 2 }) {
   const taken = new Set(
-    db.prepare('SELECT scheduled_date, scheduled_time FROM appointments').all()
+    db.prepare('SELECT scheduled_date, scheduled_time FROM appointments WHERE scheduled_date BETWEEN ? AND ?')
+      .all(toLocalIso(from), toLocalIso(to))
       .map((r) => `${r.scheduled_date} ${r.scheduled_time}`),
   );
   const earliest = now.getTime() + MIN_LEAD_MINUTES * 60 * 1000;
@@ -70,21 +71,20 @@ function findOpenSlotsBetween(db, { from, to, now, count = 2 }) {
 }
 
 function bookAppointment(db, {
-  mrn, patientType, date, time, reason, reasonTranscript, extractionConfidence,
+  mrn, patientType, date, time, reason, extractionConfidence,
 }) {
   const info = db.prepare(`
-    INSERT INTO appointments (mrn, patient_type, scheduled_date, scheduled_time, reason, reason_transcript, extraction_confidence)
-    VALUES (@mrn, @patientType, @date, @time, @reason, @reasonTranscript, @extractionConfidence)
+    INSERT INTO appointments (mrn, patient_type, scheduled_date, scheduled_time, reason, extraction_confidence)
+    VALUES (@mrn, @patientType, @date, @time, @reason, @extractionConfidence)
   `).run({
     mrn: mrn ?? null,
     patientType,
     date,
     time,
     reason: reason ?? null,
-    reasonTranscript: reasonTranscript ?? null,
     extractionConfidence: extractionConfidence ?? null,
   });
   return info.lastInsertRowid;
 }
 
-module.exports = { findOpenSlotsBetween, bookAppointment, SLOT_TIMES, MIN_LEAD_MINUTES, toLocalIso };
+module.exports = { findOpenSlotsBetween, bookAppointment, SLOT_TIMES };

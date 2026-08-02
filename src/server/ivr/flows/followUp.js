@@ -1,36 +1,37 @@
-// Follow-up: lightest path — find the existing record, get the reason,
-// schedule. The MRN/phone step does a DB lookup inside accept(): an
-// extraction can be perfectly confident and still not match a record, and
-// that case gets its own prompt (record_not_found), not the generic one.
+// Follow-up: name, phone, and plan type (comercial vs. Reforma / Plan
+// Vital), then the shared scheduling step. No record lookup and no reason
+// question (clinic decision, 2026-07-30) — the booking reuses the record
+// whose phone matches, like the post-op flow, else creates one. Vital
+// callers get the referido reminder right after the type lands; there is
+// no company question on this path, so the reminder never defers.
 
 const patients = require('../../db/patients');
-const { askReason } = require('../optionalQuestions');
+const { phoneSteps } = require('./phoneSteps');
+const { acceptInsuranceType } = require('./insuranceTypeStep');
 
 const steps = [
+  { field: 'fullName', promptId: 'ask_full_name' },
+  ...phoneSteps,
   {
-    field: 'mrnOrPhone',
-    promptId: 'ask_mrn_or_phone',
-    accept(db, session, value) {
-      const found = (value.mrn && patients.findByMrn(db, String(value.mrn).toUpperCase().replace(/\s/g, '')))
-        || (value.phone && patients.findByPhone(db, value.phone));
-      if (!found) return { ok: false, promptId: 'record_not_found' };
-      session.patient = found;
-      return { ok: true };
-    },
+    field: 'insuranceType',
+    promptId: 'ask_insurance_type',
+    accept: acceptInsuranceType, // shared with new patient (insuranceTypeStep.js)
+    after: (s) => (s.data.insuranceType.insurance_type === 'vital' ? 'vital_referral_reminder' : null),
   },
-  // Same ASK_REASON switch as the new-patient flow — it controls the
-  // "motivo de su cita" question wherever it is asked. With it off, this
-  // flow is just the record lookup straight into scheduling.
-  { field: 'reason', promptId: 'ask_followup_reason', skip: () => !askReason() },
 ];
 
-function finalize(db, data, session) {
-  return {
-    mrn: session.patient.mrn,
-    reason: data.reason?.reason ?? null,
-    reasonTranscript: session.transcripts.reason ?? null,
-    smsPhone: session.patient.phone,
-  };
+function finalize(db, data) {
+  const phone = String(data.phone.phone).replace(/\D/g, '');
+  const existing = patients.findByPhone(db, phone);
+  const mrn = existing ? existing.mrn : patients.createPatient(db, {
+    firstName: data.fullName.first_name,
+    lastName: data.fullName.last_name,
+    phone,
+    // Only lands when the caller named the company alongside the type
+    // ("tengo Triple-S Vital") — there's no dedicated company question.
+    insuranceProvider: data.insuranceType.provider ?? null,
+  });
+  return { mrn, reason: null, smsPhone: phone };
 }
 
 module.exports = { patientType: 'follow_up', steps, finalize };

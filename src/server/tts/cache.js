@@ -48,9 +48,6 @@ async function buildPromptCache({ fetchImpl = fetch, log = console.log } = {}) {
       if (!frames) throw new Error(`prompt not in cache: ${id}`);
       return frames;
     },
-    has(id) {
-      return cache.has(id);
-    },
     // Dynamic sentences only (slot offer / confirmation). Logged so any
     // unexpected live-TTS use shows up in per-turn latency review.
     async synthesizeDynamic(text) {
@@ -62,4 +59,4 @@ async function buildPromptCache({ fetchImpl = fetch, log = console.log } = {}) {
   };
 }
 
-module.exports = { buildPromptCache, synthesizeToFrames, FRAME_BYTES };
+module.exports = { buildPromptCache, FRAME_BYTES };
