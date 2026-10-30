@@ -100,6 +100,3 @@ scripts/      Dev, setup, and utility scripts (e.g. dev.sh, google-auth.js)
 - This project is designed for a clinic and handles patient information. Review it against the privacy and data-handling rules that apply in your jurisdiction before using it with real callers.
 - The default speaking pace is slowed down (`TTS_LENGTH_SCALE=1.25`) because the caller base is mostly older adults.
 
-## License
-
-No license has been specified yet.
